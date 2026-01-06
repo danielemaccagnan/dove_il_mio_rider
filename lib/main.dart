@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'logger_service.dart';
 import 'manager_screen.dart';
 import 'rider_screen.dart';
@@ -96,7 +97,23 @@ class HomeScreen extends StatelessWidget {
                     context,
                     MaterialPageRoute(
                       builder: (context) => Scaffold(
-                        appBar: AppBar(title: const Text("Log Errori")),
+                        appBar: AppBar(
+                          title: const Text("Log Errori"),
+                          actions: [
+                            IconButton(
+                              icon: const Icon(Icons.copy),
+                              tooltip: 'Copia Log',
+                              onPressed: () async {
+                                await Clipboard.setData(ClipboardData(text: logs));
+                                if (context.mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(content: Text('Log copiati negli appunti!')),
+                                  );
+                                }
+                              },
+                            ),
+                          ],
+                        ),
                         body: SingleChildScrollView(
                           padding: const EdgeInsets.all(16),
                           child: SelectableText(logs),
