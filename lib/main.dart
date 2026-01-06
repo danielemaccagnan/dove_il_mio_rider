@@ -1,12 +1,27 @@
+import 'dart:async';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
+import 'logger_service.dart';
 import 'manager_screen.dart';
 import 'rider_screen.dart';
 
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp();
-  runApp(const MyApp());
+  runZonedGuarded(() async {
+    WidgetsFlutterBinding.ensureInitialized();
+    await LoggerService().init();
+    await LoggerService().log("App avviata");
+    
+    try {
+      await Firebase.initializeApp();
+      await LoggerService().log("Firebase inizializzato correttamente");
+    } catch (e, stack) {
+      await LoggerService().log("Errore inizializzazione Firebase: $e\n$stack");
+    }
+    
+    runApp(const MyApp());
+  }, (error, stack) {
+     LoggerService().log("ERRORE GLOBALE: $error\n$stack");
+  });
 }
 
 class MyApp extends StatelessWidget {
@@ -71,6 +86,35 @@ class HomeScreen extends StatelessWidget {
                 ),
                 child: const Text('SONO IL MANAGER 🍕'),
               ),
+            ),
+            const SizedBox(height: 30),
+             TextButton.icon(
+              onPressed: () async {
+                String logs = await LoggerService().getLogs();
+                if (context.mounted) {
+                   Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => Scaffold(
+                        appBar: AppBar(title: const Text("Log Errori")),
+                        body: SingleChildScrollView(
+                          padding: const EdgeInsets.all(16),
+                          child: SelectableText(logs),
+                        ),
+                        floatingActionButton: FloatingActionButton(
+                          child: const Icon(Icons.delete),
+                          onPressed: () async {
+                              await LoggerService().clearLogs();
+                              if(context.mounted) Navigator.pop(context);
+                          },
+                        ),
+                      ),
+                    ),
+                  );
+                }
+              },
+              icon: const Icon(Icons.bug_report),
+              label: const Text('Visualizza Log Errori'),
             ),
           ],
         ),
