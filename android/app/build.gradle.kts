@@ -31,6 +31,20 @@ android {
         versionName = flutter.versionName
     }
 
+    flavorDimensions += "version"
+    productFlavors {
+        create("rider") {
+            dimension = "version"
+            applicationId = "com.example.dove_il_mio_rider"
+            resValue("string", "app_name", "Dove Rider")
+        }
+        create("manager") {
+            dimension = "version"
+            applicationId = "com.example.dove_il_mio_rider.manager"
+            resValue("string", "app_name", "Dove Manager")
+        }
+    }
+
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.

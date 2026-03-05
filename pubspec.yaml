@@ -40,6 +40,8 @@ dependencies:
   cloud_firestore: ^6.1.1
   permission_handler: ^12.0.1
   path_provider: ^2.1.5
+  shared_preferences: ^2.3.5
+  flutter_overlay_window: ^0.4.5
 
 dev_dependencies:
   flutter_test:
