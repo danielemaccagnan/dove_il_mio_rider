@@ -1,0 +1,4 @@
+#include "Generated.xcconfig"
+
+APP_DISPLAY_NAME=Dov'è il mio Rider (Manager)
+PRODUCT_BUNDLE_IDENTIFIER=com.example.dove-il-mio-rider.manager
