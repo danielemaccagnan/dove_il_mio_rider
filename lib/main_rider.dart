@@ -6,8 +6,13 @@ import 'rider_screen.dart';
 import 'overlay_main.dart'; 
 
 @pragma("vm:entry-point")
-void overlayMain() {
+Future<void> overlayMain() async {
   WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await Firebase.initializeApp();
+  } catch (e) {
+    debugPrint("ERRORE FIREBASE IN OVERLAY: $e");
+  }
   runApp(const MaterialApp(
     debugShowCheckedModeBanner: false,
     home: FloatingBubbleOverlay(),

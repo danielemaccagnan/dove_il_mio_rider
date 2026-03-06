@@ -23,6 +23,8 @@ class _RiderScreenState extends State<RiderScreen> {
   String _currentStatus = 'offline';
   StreamSubscription<Position>? _positionStream;
   StreamSubscription? _overlayListener;
+  StreamSubscription? _statusSubscription;
+  bool _isInternalChange = false;
 
   @override
   void initState() {
@@ -31,13 +33,64 @@ class _RiderScreenState extends State<RiderScreen> {
     _initOverlayListener();
   }
 
-  void _initOverlayListener() {
-    _overlayListener = FlutterOverlayWindow.overlayListener.listen((event) {
-      if (event is String && _isConfigured) {
-        // Prevent infinite loop by checking if it's already in that status
-        if (_currentStatus != event) {
-          _toggleTracking(event);
+  void _initStatusListener(String pizzeriaId, String name) {
+    _statusSubscription?.cancel();
+    _statusSubscription = _firestore
+        .collection('pizzerie')
+        .doc(pizzeriaId)
+        .collection('riders')
+        .doc(name)
+        .snapshots()
+        .listen((snapshot) {
+        if (_isInternalChange) {
+          LoggerService().log('Ignoro update Firestore (cambio interno)');
+          return;
         }
+
+        final data = snapshot.data();
+        final serverStatus = data?['status'] as String?;
+        if (serverStatus != null && serverStatus != _currentStatus) {
+          LoggerService().log('Sync Firestore -> Local: $serverStatus');
+          // If we are offline on Firestore but local is not, we might need to stop tracking
+          // But usually this listener is for moving from consegna <-> rientro
+          if (serverStatus == 'offline' && _currentStatus != 'offline') {
+             _stopTracking(keepOverlay: true);
+          } else if (serverStatus != 'offline' && _currentStatus != serverStatus) {
+             // If we are switching active statuses
+             if (_isConfigured) {
+               _toggleTracking(serverStatus);
+             }
+          }
+        }
+      });
+  }
+
+  void _initOverlayListener() {
+    LoggerService().log('Inizializzazione Listener Overlay...');
+    _overlayListener = FlutterOverlayWindow.overlayListener.listen((event) {
+      LoggerService().log('MESSAGGIO RICEVUTO DALL\'OVERLAY: "$event" (tipo: ${event.runtimeType})');
+      
+      String? newStatus;
+      if (event is String) {
+        newStatus = event;
+      } else if (event is Map && event.containsKey('status')) {
+        newStatus = event['status'];
+      }
+
+      if (newStatus != null) {
+        if (!_isConfigured) {
+          LoggerService().log('Attenzione: App non ancora configurata, ignoro messaggio.');
+          return;
+        }
+
+        if (_currentStatus != newStatus) {
+          LoggerService().log('ESEGUO CAMBIO STATO DA OVERLAY: $newStatus');
+          _toggleTracking(newStatus);
+        } else {
+          LoggerService().log('Stato già impostato a $newStatus, ignoro.');
+        }
+      } else {
+        LoggerService().log('Ricevuto evento non riconosciuto: $event');
       }
     });
   }
@@ -53,6 +106,32 @@ class _RiderScreenState extends State<RiderScreen> {
         _pizzeriaController.text = savedPizzeria;
         _isConfigured = true;
       });
+      _initStatusListener(savedPizzeria, savedName);
+      _ensureOverlayIsShown();
+    }
+  }
+
+  Future<void> _ensureOverlayIsShown() async {
+    LoggerService().log('Controllo se mostrare la bolla persistente...');
+    try {
+      if (await FlutterOverlayWindow.isPermissionGranted()) {
+        if (!await FlutterOverlayWindow.isActive()) {
+          LoggerService().log('Avvio bolla persistente...');
+          await FlutterOverlayWindow.showOverlay(
+            enableDrag: true,
+            overlayTitle: "Dove Rider Status",
+            overlayContent: "Bolla per cambio stato rapido",
+            flag: OverlayFlag.defaultFlag,
+            visibility: NotificationVisibility.visibilityPublic,
+            height: 250, 
+            width: 250, 
+          );
+        }
+      } else {
+        LoggerService().log('Permesso overlay mancante per la bolla persistente.');
+      }
+    } catch (e) {
+      LoggerService().log('Errore avvio bolla persistente: $e');
     }
   }
 
@@ -85,10 +164,13 @@ class _RiderScreenState extends State<RiderScreen> {
     setState(() {
       _isConfigured = true;
     });
+    _initStatusListener(pizzeriaId, name);
+    _ensureOverlayIsShown();
   }
 
   Future<void> _resetConfiguration() async {
     await _stopTracking();
+    await FlutterOverlayWindow.closeOverlay();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('rider_name');
     await prefs.remove('pizzeria_id');
@@ -106,6 +188,7 @@ class _RiderScreenState extends State<RiderScreen> {
     _nameController.dispose();
     _pizzeriaController.dispose();
     FlutterOverlayWindow.closeOverlay();
+    _statusSubscription?.cancel();
     super.dispose();
   }
 
@@ -120,6 +203,7 @@ class _RiderScreenState extends State<RiderScreen> {
       return;
     }
 
+    _isInternalChange = true;
     setState(() {
       _isLoading = true;
     });
@@ -140,7 +224,7 @@ class _RiderScreenState extends State<RiderScreen> {
       }
 
       LoggerService().log('Fermo tracking precedente...');
-      await _stopTracking();
+      await _stopTracking(keepOverlay: true);
 
       late final LocationSettings locationSettings;
       
@@ -187,27 +271,13 @@ class _RiderScreenState extends State<RiderScreen> {
       }
       
       LoggerService().log('Aggiorno Firestore iniziale...');
+      if (mounted) {
+        setState(() {
+          _currentStatus = status;
+        });
+      }
       await _updateFirestorePosition(pizzeriaId, name, status, initialPosition);
 
-      /* Temporaneamente disabilitato per debug hang
-      LoggerService().log('Controllo permessi Overlay...');
-      if (await FlutterOverlayWindow.isPermissionGranted()) {
-        LoggerService().log('Mostro Overlay...');
-        await FlutterOverlayWindow.showOverlay(
-          enableDrag: true,
-          overlayTitle: "Dove Rider Status",
-          overlayContent: "Bolla per cambio stato rapido",
-          flag: OverlayFlag.defaultFlag,
-          visibility: NotificationVisibility.visibilityPublic,
-          height: 150, 
-          width: 150, 
-        );
-      }
-      */
-
-      setState(() {
-        _currentStatus = status;
-      });
       LoggerService().log('Tracking attivato con successo');
 
       if (mounted) {
@@ -230,6 +300,7 @@ class _RiderScreenState extends State<RiderScreen> {
         );
       }
     } finally {
+      _isInternalChange = false;
       if (mounted) {
         setState(() {
           _isLoading = false;
@@ -238,48 +309,52 @@ class _RiderScreenState extends State<RiderScreen> {
     }
   }
 
-  Future<void> _stopTracking() async {
-    LoggerService().log('Eseguo _stopTracking...');
+  Future<void> _stopTracking({bool keepOverlay = false}) async {
+    _isInternalChange = true;
+    LoggerService().log('Eseguo _stopTracking (keepOverlay: $keepOverlay)...');
     try {
       await _positionStream?.cancel();
       _positionStream = null;
-    } catch (e) {
-      LoggerService().log('Errore cancellazione stream: $e');
-    }
 
-    try {
-      // Chiudiamo l'overlay in modo asincrono senza attenderlo se rischia di bloccare
-      FlutterOverlayWindow.closeOverlay().catchError((e) => LoggerService().log('Errore chiusura overlay: $e'));
-    } catch (e) {
-      LoggerService().log('Eccezione chiusura overlay: $e');
-    }
-    
-    final String name = _nameController.text.trim();
-    final String pizzeriaId = _pizzeriaController.text.trim();
-    
-    if (name.isNotEmpty && pizzeriaId.isNotEmpty && _currentStatus != 'offline') {
-      LoggerService().log('Aggiorno Firestore a offline...');
-      try {
-        await _firestore
-            .collection('pizzerie')
-            .doc(pizzeriaId)
-            .collection('riders')
-            .doc(name)
-            .update({
-          'status': 'offline',
-          'timestamp': FieldValue.serverTimestamp(),
-        });
-      } catch (e) {
-        LoggerService().log('Errore aggiornamento Firestore offline: $e');
+      if (!keepOverlay) {
+        try {
+          await FlutterOverlayWindow.closeOverlay();
+        } catch (e) {
+          LoggerService().log('Errore chiusura overlay: $e');
+        }
       }
-    }
+      
+      final String name = _nameController.text.trim();
+      final String pizzeriaId = _pizzeriaController.text.trim();
+      
+      if (name.isNotEmpty && pizzeriaId.isNotEmpty && _currentStatus != 'offline') {
+        LoggerService().log('Aggiorno Firestore a offline...');
+        
+        // Aggiorniamo lo stato locale PRIMA della scrittura per evitare loop col listener
+        if (mounted) {
+          setState(() {
+            _currentStatus = 'offline';
+          });
+        }
 
-    if (mounted) {
-      setState(() {
-        _currentStatus = 'offline';
-      });
+        try {
+          await _firestore
+              .collection('pizzerie')
+              .doc(pizzeriaId)
+              .collection('riders')
+              .doc(name)
+              .update({
+            'status': 'offline',
+            'timestamp': FieldValue.serverTimestamp(),
+          });
+        } catch (e) {
+          LoggerService().log('Errore aggiornamento Firestore offline: $e');
+        }
+      }
+    } finally {
+      _isInternalChange = false;
+      LoggerService().log('_stopTracking completato.');
     }
-    LoggerService().log('_stopTracking completato.');
   }
 
   Future<void> _updateFirestorePosition(String pizzeriaId, String name, String status, Position position) async {

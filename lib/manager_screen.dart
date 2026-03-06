@@ -23,7 +23,10 @@ class _ManagerScreenState extends State<ManagerScreen> {
 
   GoogleMapController? _mapController;
   final TextEditingController _pizzeriaController = TextEditingController();
-  final Map<String, BitmapDescriptor> _customMarkers = {};
+  final Map<String, BitmapDescriptor> _descriptorCache = {};
+  final Map<String, String> _riderStatusCache = {}; // riderId -> "name_status"
+  final ValueNotifier<Set<Marker>> _markersNotifier = ValueNotifier({});
+  StreamSubscription? _riderSubscription;
   String? _pizzeriaId;
   bool _isConfigured = false;
   bool _isLoading = true;
@@ -42,9 +45,69 @@ class _ManagerScreenState extends State<ManagerScreen> {
       if (savedPizzeria != null && savedPizzeria.isNotEmpty) {
         _pizzeriaId = savedPizzeria;
         _isConfigured = true;
+        _startRiderListener(savedPizzeria);
       }
       _isLoading = false;
     });
+  }
+
+  void _startRiderListener(String pizzeriaId) {
+    _riderSubscription?.cancel();
+    _riderSubscription = FirebaseFirestore.instance
+        .collection('pizzerie')
+        .doc(pizzeriaId)
+        .collection('riders')
+        .where('status', isNotEqualTo: 'offline')
+        .snapshots()
+        .listen((snapshot) {
+      _updateMarkers(snapshot.docs);
+    });
+  }
+
+  Future<void> _updateMarkers(List<QueryDocumentSnapshot> docs) async {
+    final Set<Marker> newMarkers = {};
+    
+    for (var doc in docs) {
+      final data = doc.data() as Map<String, dynamic>;
+      final String name = data['name'] ?? 'Sconosciuto';
+      final String status = data['status'] ?? 'unknown';
+      final double? lat = (data['lat'] as num?)?.toDouble();
+      final double? lng = (data['lng'] as num?)?.toDouble();
+
+      if (lat != null && lng != null) {
+        final Color color = status == 'consegna' ? Colors.green : Colors.orange;
+        
+        // Cache key includes status to detect changes
+        final String statusKey = '${name}_$status';
+        
+        BitmapDescriptor icon;
+        // Only regenerate descriptor if name or status changed
+        if (_riderStatusCache[doc.id] != statusKey || !_descriptorCache.containsKey(statusKey)) {
+          icon = await _createCustomMarker(name, color);
+          _riderStatusCache[doc.id] = statusKey;
+          _descriptorCache[statusKey] = icon;
+        } else {
+          icon = _descriptorCache[statusKey]!;
+        }
+
+        newMarkers.add(
+          Marker(
+            markerId: MarkerId(doc.id),
+            position: LatLng(lat, lng),
+            infoWindow: InfoWindow(
+              title: name,
+              snippet: 'Stato: ${status.toUpperCase()}',
+            ),
+            icon: icon,
+            anchor: const Offset(0.5, 1.0), // Better positioning
+          ),
+        );
+      }
+    }
+
+    if (mounted) {
+      _markersNotifier.value = newMarkers;
+    }
   }
 
   Future<void> _saveConfiguration() async {
@@ -64,23 +127,27 @@ class _ManagerScreenState extends State<ManagerScreen> {
       _pizzeriaId = pizzeriaId;
       _isConfigured = true;
     });
+    _startRiderListener(pizzeriaId);
   }
 
   Future<void> _resetConfiguration() async {
+    _riderSubscription?.cancel();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('pizzeria_id');
     setState(() {
       _pizzeriaId = null;
       _isConfigured = false;
       _pizzeriaController.clear();
-      _customMarkers.clear();
+      _descriptorCache.clear();
+      _riderStatusCache.clear();
+      _markersNotifier.value = {};
     });
   }
 
   Future<BitmapDescriptor> _createCustomMarker(String name, Color color) async {
     final String cacheKey = '${name}_${color.value}';
-    if (_customMarkers.containsKey(cacheKey)) {
-      return _customMarkers[cacheKey]!;
+    if (_descriptorCache.containsKey(cacheKey)) {
+      return _descriptorCache[cacheKey]!;
     }
 
     final ui.PictureRecorder pictureRecorder = ui.PictureRecorder();
@@ -126,13 +193,15 @@ class _ManagerScreenState extends State<ManagerScreen> {
     final Uint8List uint8List = byteData!.buffer.asUint8List();
 
     final BitmapDescriptor descriptor = BitmapDescriptor.fromBytes(uint8List);
-    _customMarkers[cacheKey] = descriptor;
+    _descriptorCache[cacheKey] = descriptor;
     return descriptor;
   }
 
   @override
   void dispose() {
+    _riderSubscription?.cancel();
     _pizzeriaController.dispose();
+    _markersNotifier.dispose();
     super.dispose();
   }
 
@@ -183,36 +252,15 @@ class _ManagerScreenState extends State<ManagerScreen> {
       ),
       body: Stack(
         children: [
-          StreamBuilder<QuerySnapshot>(
-            stream: FirebaseFirestore.instance
-                .collection('pizzerie')
-                .doc(_pizzeriaId)
-                .collection('riders')
-                .where('status', isNotEqualTo: 'offline')
-                .snapshots(),
-            builder: (context, snapshot) {
-              if (snapshot.hasError) {
-                LoggerService().log('Errore Stream Firestore: ${snapshot.error}');
-                return Center(child: Text('Errore: ${snapshot.error}'));
-              }
-
-              if (snapshot.connectionState == ConnectionState.waiting) {
-                return const Center(child: CircularProgressIndicator());
-              }
-
-              if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-                return GoogleMap(
-                  initialCameraPosition: _comoPosition,
-                  onMapCreated: (controller) => _mapController = controller,
-                );
-              }
-
-              return FutureBuilder<Set<Marker>>(
-                future: _buildMarkers(snapshot.data!.docs),
-                builder: (context, markerSnapshot) {
-                  return GoogleMap(
+          ValueListenableBuilder<Set<Marker>>(
+            valueListenable: _markersNotifier,
+            builder: (context, markers, _) {
+              return Stack(
+                children: [
+                  GoogleMap(
+                    key: const ValueKey('manager_google_map'),
                     initialCameraPosition: _comoPosition,
-                    markers: markerSnapshot.data ?? {},
+                    markers: markers,
                     myLocationEnabled: true,
                     myLocationButtonEnabled: false,
                     zoomControlsEnabled: false,
@@ -220,8 +268,29 @@ class _ManagerScreenState extends State<ManagerScreen> {
                       _mapController = controller;
                       LoggerService().log('Google Map creata per pizzeria $_pizzeriaId');
                     },
-                  );
-                },
+                  ),
+                  
+                  // Se non ci sono rider online, mostriamo un piccolo avviso
+                  if (markers.isEmpty)
+                    Positioned(
+                      top: 100,
+                      left: 20,
+                      right: 20,
+                      child: Center(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withOpacity(0.6),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: const Text(
+                            'Nessun rider online al momento',
+                            style: TextStyle(color: Colors.white, fontSize: 13),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               );
             },
           ),
@@ -306,34 +375,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
     );
   }
 
-  Future<Set<Marker>> _buildMarkers(List<QueryDocumentSnapshot> docs) async {
-    final Set<Marker> markers = {};
-    for (var doc in docs) {
-      final data = doc.data() as Map<String, dynamic>;
-      final String name = data['name'] ?? 'Sconosciuto';
-      final String status = data['status'] ?? 'unknown';
-      final double? lat = (data['lat'] as num?)?.toDouble();
-      final double? lng = (data['lng'] as num?)?.toDouble();
 
-      if (lat != null && lng != null) {
-        final Color color = status == 'consegna' ? Colors.green : Colors.orange;
-        final BitmapDescriptor icon = await _createCustomMarker(name, color);
-
-        markers.add(
-          Marker(
-            markerId: MarkerId(doc.id),
-            position: LatLng(lat, lng),
-            infoWindow: InfoWindow(
-              title: name,
-              snippet: 'Stato: ${status.toUpperCase()}',
-            ),
-            icon: icon,
-          ),
-        );
-      }
-    }
-    return markers;
-  }
 
   Widget _buildSetupScreen() {
     return Scaffold(
