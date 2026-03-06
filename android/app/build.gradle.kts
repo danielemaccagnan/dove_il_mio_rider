@@ -36,12 +36,12 @@ android {
         create("rider") {
             dimension = "version"
             applicationId = "com.example.dove_il_mio_rider"
-            resValue("string", "app_name", "Dove Rider")
+            resValue("string", "app_name", "Dov\\\'è il mio Rider")
         }
         create("manager") {
             dimension = "version"
             applicationId = "com.example.dove_il_mio_rider.manager"
-            resValue("string", "app_name", "Dove Manager")
+            resValue("string", "app_name", "Dov\\\'è il mio Rider (Manager)")
         }
     }
 

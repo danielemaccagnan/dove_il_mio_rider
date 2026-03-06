@@ -1,0 +1,31 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Rider (Flavor)",
+      "request": "launch",
+      "type": "dart",
+      "program": "lib/main_rider.dart",
+      "args": ["--flavor", "rider"]
+    },
+    {
+      "name": "Manager (Flavor)",
+      "request": "launch",
+      "type": "dart",
+      "program": "lib/main_manager.dart",
+      "args": ["--flavor", "manager"]
+    },
+    {
+      "name": "Run Both Apps",
+      "request": "launch",
+      "type": "dart",
+      "program": "lib/main.dart"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Both Rider & Manager",
+      "configurations": ["Rider (Flavor)", "Manager (Flavor)"]
+    }
+  ]
+}
