@@ -4,6 +4,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'logger_service.dart';
@@ -45,6 +46,17 @@ class _ManagerScreenState extends State<ManagerScreen>
   // Limita gli aggiornamenti dei marker sulla mappa a ~30fps (basta e avanza,
   // e alleggerisce il canale nativo di Google Maps).
   Duration _lastRebuild = Duration.zero;
+
+  // --- Lista rider + stima rientro ---
+  // Posizione del manager = posizione del locale (GPS del telefono manager).
+  Position? _managerPosition;
+  // Bump quando cambiano i dati dei rider (da Firestore o quando arriva la
+  // posizione del manager): la lista in basso si aggiorna senza ridisegnare a
+  // 30fps come i marker.
+  final ValueNotifier<int> _ridersVersion = ValueNotifier(0);
+  // Parametri per la stima del tempo di rientro (linea d'aria -> stima strada).
+  static const double _avgSpeedKmh = 25; // velocità media realistica in città
+  static const double _roadFactor = 1.4; // le strade non sono in linea d'aria
 
   @override
   void initState() {
@@ -103,6 +115,57 @@ class _ManagerScreenState extends State<ManagerScreen>
       }
       _isLoading = false;
     });
+    if (_isConfigured) _loadManagerPosition();
+  }
+
+  /// Ottiene la posizione del manager (= posizione del locale) per stimare il
+  /// tempo di rientro dei rider. Se il permesso manca, l'app funziona comunque
+  /// (semplicemente non mostra la stima in minuti).
+  Future<void> _loadManagerPosition() async {
+    try {
+      LocationPermission perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm == LocationPermission.denied ||
+          perm == LocationPermission.deniedForever) {
+        return;
+      }
+      Position? pos;
+      try {
+        pos = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+          ),
+        ).timeout(const Duration(seconds: 8));
+      } catch (_) {
+        pos = await Geolocator.getLastKnownPosition();
+      }
+      if (pos != null && mounted) {
+        setState(() => _managerPosition = pos);
+        _ridersVersion.value++; // aggiorna la lista se è aperta
+      }
+    } catch (e) {
+      LoggerService().log('Manager: posizione non disponibile: $e');
+    }
+  }
+
+  /// Stima i minuti di rientro dal punto [riderPos] alla posizione del manager.
+  /// Usa la distanza in linea d'aria moltiplicata per un fattore "strada",
+  /// divisa per una velocità media. Approssimazione, non navigazione reale.
+  int? _etaMinutes(LatLng riderPos) {
+    final m = _managerPosition;
+    if (m == null) return null;
+    final double straight = Geolocator.distanceBetween(
+      riderPos.latitude,
+      riderPos.longitude,
+      m.latitude,
+      m.longitude,
+    );
+    final double roadMeters = straight * _roadFactor;
+    final double metersPerMinute = _avgSpeedKmh * 1000 / 60;
+    final int mins = (roadMeters / metersPerMinute).ceil();
+    return mins < 1 ? 1 : mins;
   }
 
   void _startRiderListener(String pizzeriaId) {
@@ -169,6 +232,7 @@ class _ManagerScreenState extends State<ManagerScreen>
     _riders.removeWhere((id, _) => !seenIds.contains(id));
 
     _rebuildMarkers(); // riflette subito nuovi rider / rimozioni
+    _ridersVersion.value++; // aggiorna la lista in basso
     if (needsTicker && !_ticker.isActive) {
       _lastRebuild = Duration.zero;
       _ticker.start();
@@ -193,6 +257,7 @@ class _ManagerScreenState extends State<ManagerScreen>
       _isConfigured = true;
     });
     _startRiderListener(pizzeriaId);
+    _loadManagerPosition();
   }
 
   Future<void> _resetConfiguration() async {
@@ -275,12 +340,196 @@ class _ManagerScreenState extends State<ManagerScreen>
     return descriptor;
   }
 
+  /// Apre la lista dei rider divisa per stato, con stima di rientro.
+  void _showRidersList() {
+    // Aggiorna la posizione del locale all'apertura (il manager potrebbe
+    // essersi spostato), poi la lista si aggiorna da sola.
+    _loadManagerPosition();
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.white,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (context) {
+        return ValueListenableBuilder<int>(
+          valueListenable: _ridersVersion,
+          builder: (context, _, _) {
+            final consegna =
+                _riders.values.where((r) => r.status == 'consegna').toList()
+                  ..sort((a, b) => a.name.compareTo(b.name));
+            final rientro =
+                _riders.values.where((r) => r.status == 'rientro').toList();
+            // I rientranti ordinati per ETA crescente (prima chi arriva prima).
+            rientro.sort((a, b) {
+              final ea = _etaMinutes(a.targetPos) ?? 9999;
+              final eb = _etaMinutes(b.targetPos) ?? 9999;
+              return ea.compareTo(eb);
+            });
+
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 40,
+                        height: 4,
+                        margin: const EdgeInsets.only(bottom: 16),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[300],
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    Text(
+                      'Rider attivi',
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.bold,
+                          ),
+                    ),
+                    if (_managerPosition == null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(
+                          'Posizione locale non disponibile: concedi il permesso GPS per la stima di rientro.',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.orange[800],
+                          ),
+                        ),
+                      ),
+                    const SizedBox(height: 16),
+                    Flexible(
+                      child: SingleChildScrollView(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            _buildRiderSection(
+                              'In consegna',
+                              Colors.green,
+                              Icons.delivery_dining,
+                              consegna,
+                              showEta: false,
+                            ),
+                            const SizedBox(height: 20),
+                            _buildRiderSection(
+                              'In rientro',
+                              Colors.orange,
+                              Icons.keyboard_return,
+                              rientro,
+                              showEta: true,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildRiderSection(
+    String title,
+    Color color,
+    IconData icon,
+    List<_RiderMarker> riders, {
+    required bool showEta,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(icon, color: color, size: 20),
+            const SizedBox(width: 8),
+            Text(
+              '$title (${riders.length})',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 16,
+                color: color,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        if (riders.isEmpty)
+          Padding(
+            padding: const EdgeInsets.only(left: 28, bottom: 4),
+            child: Text(
+              'Nessuno',
+              style: TextStyle(color: Colors.grey[500], fontSize: 14),
+            ),
+          )
+        else
+          ...riders.map((r) {
+            final eta = showEta ? _etaMinutes(r.targetPos) : null;
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: Row(
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    margin: const EdgeInsets.only(left: 28, right: 12),
+                    decoration: BoxDecoration(
+                      color: color,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  Expanded(
+                    child: Text(
+                      r.name,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                  if (showEta)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: color.withValues(alpha: 0.12),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Text(
+                        eta == null ? '— min' : '~$eta min',
+                        style: TextStyle(
+                          color: color,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            );
+          }),
+      ],
+    );
+  }
+
   @override
   void dispose() {
     _ticker.dispose();
     _riderSubscription?.cancel();
     _pizzeriaController.dispose();
     _markersNotifier.dispose();
+    _ridersVersion.dispose();
     super.dispose();
   }
 
@@ -308,6 +557,11 @@ class _ManagerScreenState extends State<ManagerScreen>
           borderRadius: BorderRadius.vertical(bottom: Radius.circular(20)),
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.format_list_bulleted_rounded),
+            tooltip: 'Lista rider',
+            onPressed: _showRidersList,
+          ),
           IconButton(
             icon: const Icon(Icons.logout_rounded),
             onPressed: () {
