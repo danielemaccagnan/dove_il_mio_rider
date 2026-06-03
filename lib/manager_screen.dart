@@ -8,6 +8,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'logger_service.dart';
+import 'pizzeria_access.dart';
 
 class ManagerScreen extends StatefulWidget {
   const ManagerScreen({super.key});
@@ -30,6 +31,7 @@ class _ManagerScreenState extends State<ManagerScreen>
   final Map<String, String> _riderStatusCache = {}; // riderId -> "name_status"
   final ValueNotifier<Set<Marker>> _markersNotifier = ValueNotifier({});
   StreamSubscription? _riderSubscription;
+  StreamSubscription? _authSubscription;
   String? _pizzeriaId;
   bool _isConfigured = false;
   bool _isLoading = true;
@@ -115,7 +117,10 @@ class _ManagerScreenState extends State<ManagerScreen>
       }
       _isLoading = false;
     });
-    if (_isConfigured) _loadManagerPosition();
+    if (_isConfigured && savedPizzeria != null) {
+      _startAuthListener(savedPizzeria);
+      _loadManagerPosition();
+    }
   }
 
   /// Ottiene la posizione del manager (= posizione del locale) per stimare il
@@ -249,6 +254,33 @@ class _ManagerScreenState extends State<ManagerScreen>
       return;
     }
 
+    // Verifica che il codice pizzeria sia autorizzato (cliente attivo).
+    final access = await checkPizzeriaAccess(pizzeriaId);
+    if (access == PizzeriaAccess.notAuthorized) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Codice pizzeria non valido o non attivo.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+    if (access == PizzeriaAccess.networkError) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Connessione assente: impossibile verificare il codice. Riprova.',
+            ),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
+      return;
+    }
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('pizzeria_id', pizzeriaId);
 
@@ -257,11 +289,35 @@ class _ManagerScreenState extends State<ManagerScreen>
       _isConfigured = true;
     });
     _startRiderListener(pizzeriaId);
+    _startAuthListener(pizzeriaId);
     _loadManagerPosition();
+  }
+
+  /// Logout automatico se l'autorizzazione della pizzeria viene revocata.
+  void _startAuthListener(String pizzeriaId) {
+    _authSubscription?.cancel();
+    _authSubscription = pizzeriaAuthorizationStream(pizzeriaId).listen((ok) {
+      if (!ok && mounted && _isConfigured) {
+        LoggerService().log('Accesso pizzeria revocato: logout automatico.');
+        _resetConfiguration();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Accesso non più autorizzato. Contatta l\'amministratore.',
+              ),
+              backgroundColor: Colors.red,
+              duration: Duration(seconds: 5),
+            ),
+          );
+        }
+      }
+    });
   }
 
   Future<void> _resetConfiguration() async {
     _riderSubscription?.cancel();
+    _authSubscription?.cancel();
     if (_ticker.isActive) _ticker.stop();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('pizzeria_id');
@@ -527,6 +583,7 @@ class _ManagerScreenState extends State<ManagerScreen>
   void dispose() {
     _ticker.dispose();
     _riderSubscription?.cancel();
+    _authSubscription?.cancel();
     _pizzeriaController.dispose();
     _markersNotifier.dispose();
     _ridersVersion.dispose();

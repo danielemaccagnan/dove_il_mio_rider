@@ -7,6 +7,7 @@ import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'logger_service.dart';
+import 'pizzeria_access.dart';
 
 class RiderScreen extends StatefulWidget {
   const RiderScreen({super.key});
@@ -26,6 +27,7 @@ class _RiderScreenState extends State<RiderScreen>
   StreamSubscription<Position>? _positionStream;
   StreamSubscription? _overlayListener;
   StreamSubscription? _statusSubscription;
+  StreamSubscription? _authSubscription;
   bool _isInternalChange = false;
 
   // Aggiornamento posizione "fluido" ma a basso costo:
@@ -156,6 +158,7 @@ class _RiderScreenState extends State<RiderScreen>
         _bubbleEnabled = bubbleEnabled;
       });
       _initStatusListener(savedPizzeria, savedName);
+      _startAuthListener(savedPizzeria);
       // La bolla parte solo se il rider l'aveva attivata.
       if (_bubbleEnabled) _ensureOverlayIsShown();
     }
@@ -252,6 +255,33 @@ class _RiderScreenState extends State<RiderScreen>
       return;
     }
 
+    // Verifica che il codice pizzeria sia autorizzato (cliente attivo).
+    final access = await checkPizzeriaAccess(pizzeriaId);
+    if (access == PizzeriaAccess.notAuthorized) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Codice pizzeria non valido o non attivo.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+    if (access == PizzeriaAccess.networkError) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Connessione assente: impossibile verificare il codice. Riprova.',
+            ),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
+      return;
+    }
+
     // Permesso GPS richiesto SUBITO, in primo piano. Fondamentale: così quando
     // poi avvii il tracking dalla bolla (con l'app in background) il permesso è
     // già concesso e non serve mostrare alcun dialog — cosa che Android non
@@ -284,6 +314,30 @@ class _RiderScreenState extends State<RiderScreen>
       _isConfigured = true;
     });
     _initStatusListener(pizzeriaId, name);
+    _startAuthListener(pizzeriaId);
+  }
+
+  /// Ascolta in tempo reale l'autorizzazione della pizzeria: se viene revocata
+  /// (cliente rimosso o disattivato), fa il logout automatico.
+  void _startAuthListener(String pizzeriaId) {
+    _authSubscription?.cancel();
+    _authSubscription = pizzeriaAuthorizationStream(pizzeriaId).listen((ok) {
+      if (!ok && mounted && _isConfigured) {
+        LoggerService().log('Accesso pizzeria revocato: logout automatico.');
+        _resetConfiguration();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Accesso non più autorizzato. Contatta l\'amministratore.',
+              ),
+              backgroundColor: Colors.red,
+              duration: Duration(seconds: 5),
+            ),
+          );
+        }
+      }
+    });
   }
 
   Future<void> _resetConfiguration() async {
@@ -324,10 +378,12 @@ class _RiderScreenState extends State<RiderScreen>
 
     try {
       await _statusSubscription?.cancel();
+      await _authSubscription?.cancel();
     } catch (e) {
       LoggerService().log('Errore cancel listener durante reset: $e');
     }
     _statusSubscription = null;
+    _authSubscription = null;
 
     if (_overlaySupported) {
       try {
@@ -381,6 +437,7 @@ class _RiderScreenState extends State<RiderScreen>
     _pizzeriaController.dispose();
     if (_overlaySupported) FlutterOverlayWindow.closeOverlay();
     _statusSubscription?.cancel();
+    _authSubscription?.cancel();
     super.dispose();
   }
 
