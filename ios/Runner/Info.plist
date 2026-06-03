@@ -46,8 +46,15 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Serve per tracciare la consegna</string>
+	<string>Serve per tracciare la posizione del rider durante le consegne.</string>
 	<key>NSLocationAlwaysUsageDescription</key>
-	<string>Serve per tracciare la consegna</string>
+	<string>Serve per tracciare la posizione del rider durante le consegne, anche in background.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Serve per tracciare la posizione del rider durante le consegne, anche in background.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<string>fetch</string>
+	</array>
 </dict>
 </plist>

@@ -34,6 +34,11 @@ class _RiderScreenState extends State<RiderScreen>
   // Risolve la race tra _toggleTracking (lungo) e stop/reset.
   int _opGeneration = 0;
 
+  // La bolla galleggiante (flutter_overlay_window) esiste SOLO su Android:
+  // iOS non permette finestre sopra altre app. Su iOS saltiamo tutte le
+  // chiamate all'overlay, che altrimenti lancerebbero MissingPluginException.
+  bool get _overlaySupported => defaultTargetPlatform == TargetPlatform.android;
+
   @override
   void initState() {
     super.initState();
@@ -85,6 +90,7 @@ class _RiderScreenState extends State<RiderScreen>
   }
 
   void _initOverlayListener() {
+    if (!_overlaySupported) return; // iOS: nessuna bolla
     LoggerService().log('Inizializzazione Listener Overlay...');
     _overlayListener = FlutterOverlayWindow.overlayListener.listen((event) {
       LoggerService().log(
@@ -138,6 +144,7 @@ class _RiderScreenState extends State<RiderScreen>
   }
 
   Future<void> _ensureOverlayIsShown() async {
+    if (!_overlaySupported) return; // iOS: nessuna bolla
     LoggerService().log('Controllo se mostrare la bolla persistente...');
     try {
       if (await FlutterOverlayWindow.isPermissionGranted()) {
@@ -195,18 +202,20 @@ class _RiderScreenState extends State<RiderScreen>
       );
     }
 
-    // Check overlay permission
-    final bool status = await FlutterOverlayWindow.isPermissionGranted();
-    if (!status) {
-      final bool? granted = await FlutterOverlayWindow.requestPermission();
-      if (granted != true && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Permesso "Spostamento sopra altre app" necessario per la bolla!',
+    // Permesso bolla (solo Android: su iOS la bolla non esiste).
+    if (_overlaySupported) {
+      final bool status = await FlutterOverlayWindow.isPermissionGranted();
+      if (!status) {
+        final bool? granted = await FlutterOverlayWindow.requestPermission();
+        if (granted != true && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Permesso "Spostamento sopra altre app" necessario per la bolla!',
+              ),
             ),
-          ),
-        );
+          );
+        }
       }
     }
 
@@ -259,12 +268,14 @@ class _RiderScreenState extends State<RiderScreen>
     }
     _statusSubscription = null;
 
-    try {
-      await FlutterOverlayWindow.closeOverlay().timeout(
-        const Duration(seconds: 2),
-      );
-    } catch (e) {
-      LoggerService().log('Errore closeOverlay durante reset: $e');
+    if (_overlaySupported) {
+      try {
+        await FlutterOverlayWindow.closeOverlay().timeout(
+          const Duration(seconds: 2),
+        );
+      } catch (e) {
+        LoggerService().log('Errore closeOverlay durante reset: $e');
+      }
     }
     _notifyOverlayStatus('offline');
 
@@ -305,7 +316,7 @@ class _RiderScreenState extends State<RiderScreen>
     _overlayListener?.cancel();
     _nameController.dispose();
     _pizzeriaController.dispose();
-    FlutterOverlayWindow.closeOverlay();
+    if (_overlaySupported) FlutterOverlayWindow.closeOverlay();
     _statusSubscription?.cancel();
     super.dispose();
   }
@@ -484,6 +495,7 @@ class _RiderScreenState extends State<RiderScreen>
   /// Notifica la bolla (engine separato) del nuovo stato, così ne aggiorna
   /// il colore (verde = consegna, arancione = rientro).
   void _notifyOverlayStatus(String status) {
+    if (!_overlaySupported) return; // iOS: nessuna bolla
     FlutterOverlayWindow.shareData(status).catchError(
       (e) => LoggerService().log('Errore invio stato a overlay: $e'),
     );
@@ -513,7 +525,7 @@ class _RiderScreenState extends State<RiderScreen>
       }
       _positionStream = null;
 
-      if (!keepOverlay) {
+      if (!keepOverlay && _overlaySupported) {
         try {
           await FlutterOverlayWindow.closeOverlay().timeout(
             const Duration(seconds: 2),
