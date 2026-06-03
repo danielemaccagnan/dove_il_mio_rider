@@ -42,6 +42,8 @@ class _SimulatorControlState extends State<SimulatorControl> {
   ];
   
   Timer? _timer;
+  bool _isRunning = false;
+
   @override
   void initState() {
     super.initState();
@@ -49,6 +51,12 @@ class _SimulatorControlState extends State<SimulatorControl> {
     Future.delayed(const Duration(seconds: 2), () {
       if (mounted) _startSimulation();
     });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
   }
 
   void _startSimulation() {

@@ -40,7 +40,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
   Future<void> _loadConfiguration() async {
     final prefs = await SharedPreferences.getInstance();
     final savedPizzeria = prefs.getString('pizzeria_id');
-    
+
     setState(() {
       if (savedPizzeria != null && savedPizzeria.isNotEmpty) {
         _pizzeriaId = savedPizzeria;
@@ -60,13 +60,13 @@ class _ManagerScreenState extends State<ManagerScreen> {
         .where('status', isNotEqualTo: 'offline')
         .snapshots()
         .listen((snapshot) {
-      _updateMarkers(snapshot.docs);
-    });
+          _updateMarkers(snapshot.docs);
+        });
   }
 
   Future<void> _updateMarkers(List<QueryDocumentSnapshot> docs) async {
     final Set<Marker> newMarkers = {};
-    
+
     for (var doc in docs) {
       final data = doc.data() as Map<String, dynamic>;
       final String name = data['name'] ?? 'Sconosciuto';
@@ -76,13 +76,14 @@ class _ManagerScreenState extends State<ManagerScreen> {
 
       if (lat != null && lng != null) {
         final Color color = status == 'consegna' ? Colors.green : Colors.orange;
-        
+
         // Cache key includes status to detect changes
         final String statusKey = '${name}_$status';
-        
+
         BitmapDescriptor icon;
         // Only regenerate descriptor if name or status changed
-        if (_riderStatusCache[doc.id] != statusKey || !_descriptorCache.containsKey(statusKey)) {
+        if (_riderStatusCache[doc.id] != statusKey ||
+            !_descriptorCache.containsKey(statusKey)) {
           icon = await _createCustomMarker(name, color);
           _riderStatusCache[doc.id] = statusKey;
           _descriptorCache[statusKey] = icon;
@@ -112,17 +113,17 @@ class _ManagerScreenState extends State<ManagerScreen> {
 
   Future<void> _saveConfiguration() async {
     final pizzeriaId = _pizzeriaController.text.trim().toLowerCase();
-    
+
     if (pizzeriaId.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Inserisci un codice pizzeria valido!')),
       );
       return;
     }
-    
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('pizzeria_id', pizzeriaId);
-    
+
     setState(() {
       _pizzeriaId = pizzeriaId;
       _isConfigured = true;
@@ -152,14 +153,20 @@ class _ManagerScreenState extends State<ManagerScreen> {
 
     final ui.PictureRecorder pictureRecorder = ui.PictureRecorder();
     final Canvas canvas = Canvas(pictureRecorder);
-    
+
     const double width = 200.0;
     const double height = 80.0;
     const double radius = 20.0;
 
     // Draw Bubble background
     final Paint paint = Paint()..color = color;
-    final RRect rRect = RRect.fromLTRBR(0, 0, width, height - 20, const Radius.circular(radius));
+    final RRect rRect = RRect.fromLTRBR(
+      0,
+      0,
+      width,
+      height - 20,
+      const Radius.circular(radius),
+    );
     canvas.drawRRect(rRect, paint);
 
     // Draw Triangle pointer
@@ -188,8 +195,13 @@ class _ManagerScreenState extends State<ManagerScreen> {
     tp.layout(minWidth: width, maxWidth: width);
     tp.paint(canvas, Offset(0, (height - 20 - tp.height) / 2));
 
-    final ui.Image image = await pictureRecorder.endRecording().toImage(width.toInt(), height.toInt());
-    final ByteData? byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+    final ui.Image image = await pictureRecorder.endRecording().toImage(
+      width.toInt(),
+      height.toInt(),
+    );
+    final ByteData? byteData = await image.toByteData(
+      format: ui.ImageByteFormat.png,
+    );
     final Uint8List uint8List = byteData!.buffer.asUint8List();
 
     final BitmapDescriptor descriptor = BitmapDescriptor.fromBytes(uint8List);
@@ -218,7 +230,10 @@ class _ManagerScreenState extends State<ManagerScreen> {
     return Scaffold(
       extendBodyBehindAppBar: true,
       appBar: AppBar(
-        title: Text('Area Manager (${_pizzeriaId})', style: const TextStyle(fontWeight: FontWeight.bold)),
+        title: Text(
+          'Area Manager ($_pizzeriaId)',
+          style: const TextStyle(fontWeight: FontWeight.bold),
+        ),
         backgroundColor: Colors.white.withOpacity(0.9),
         elevation: 0,
         centerTitle: true,
@@ -235,13 +250,19 @@ class _ManagerScreenState extends State<ManagerScreen> {
                   title: const Text('Cambia Pizzeria'),
                   content: const Text('Vuoi resettare il codice pizzeria?'),
                   actions: [
-                    TextButton(onPressed: () => Navigator.pop(context), child: const Text('ANNULLA')),
+                    TextButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('ANNULLA'),
+                    ),
                     TextButton(
                       onPressed: () {
                         _resetConfiguration();
                         Navigator.pop(context);
                       },
-                      child: const Text('RESET', style: TextStyle(color: Colors.red)),
+                      child: const Text(
+                        'RESET',
+                        style: TextStyle(color: Colors.red),
+                      ),
                     ),
                   ],
                 ),
@@ -266,10 +287,12 @@ class _ManagerScreenState extends State<ManagerScreen> {
                     zoomControlsEnabled: false,
                     onMapCreated: (controller) {
                       _mapController = controller;
-                      LoggerService().log('Google Map creata per pizzeria $_pizzeriaId');
+                      LoggerService().log(
+                        'Google Map creata per pizzeria $_pizzeriaId',
+                      );
                     },
                   ),
-                  
+
                   // Se non ci sono rider online, mostriamo un piccolo avviso
                   if (markers.isEmpty)
                     Positioned(
@@ -278,7 +301,10 @@ class _ManagerScreenState extends State<ManagerScreen> {
                       right: 20,
                       child: Center(
                         child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 8,
+                          ),
                           decoration: BoxDecoration(
                             color: Colors.black.withOpacity(0.6),
                             borderRadius: BorderRadius.circular(20),
@@ -294,7 +320,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
               );
             },
           ),
-          
+
           // Legend / Summary overlay
           Positioned(
             bottom: 30,
@@ -306,19 +332,21 @@ class _ManagerScreenState extends State<ManagerScreen> {
                 // Zoom context buttons
                 FloatingActionButton.small(
                   heroTag: 'zoomIn',
-                  onPressed: () => _mapController?.animateCamera(CameraUpdate.zoomIn()),
+                  onPressed: () =>
+                      _mapController?.animateCamera(CameraUpdate.zoomIn()),
                   backgroundColor: Colors.white,
                   child: const Icon(Icons.add, color: Colors.black87),
                 ),
                 const SizedBox(height: 8),
                 FloatingActionButton.small(
                   heroTag: 'zoomOut',
-                  onPressed: () => _mapController?.animateCamera(CameraUpdate.zoomOut()),
+                  onPressed: () =>
+                      _mapController?.animateCamera(CameraUpdate.zoomOut()),
                   backgroundColor: Colors.white,
                   child: const Icon(Icons.remove, color: Colors.black87),
                 ),
                 const SizedBox(height: 16),
-                
+
                 // Summary Panel
                 Container(
                   padding: const EdgeInsets.all(16),
@@ -341,17 +369,27 @@ class _ManagerScreenState extends State<ManagerScreen> {
                         children: [
                           const Text(
                             'Legenda Stato',
-                            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                            ),
                           ),
                           Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
                             decoration: BoxDecoration(
                               color: Colors.blue.withOpacity(0.1),
                               borderRadius: BorderRadius.circular(10),
                             ),
                             child: const Text(
                               'LIVE',
-                              style: TextStyle(color: Colors.blue, fontSize: 10, fontWeight: FontWeight.bold),
+                              style: TextStyle(
+                                color: Colors.blue,
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                              ),
                             ),
                           ),
                         ],
@@ -374,8 +412,6 @@ class _ManagerScreenState extends State<ManagerScreen> {
       ),
     );
   }
-
-
 
   Widget _buildSetupScreen() {
     return Scaffold(
@@ -435,9 +471,14 @@ class _ManagerScreenState extends State<ManagerScreen> {
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.blue,
                     foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
                   ),
-                  child: const Text('ACCEDI ALLA MAPPA', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  child: const Text(
+                    'ACCEDI ALLA MAPPA',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
                 ),
               ),
             ],
@@ -456,7 +497,10 @@ class _ManagerScreenState extends State<ManagerScreen> {
           decoration: BoxDecoration(color: color, shape: BoxShape.circle),
         ),
         const SizedBox(width: 8),
-        Text(label, style: const TextStyle(fontSize: 14, color: Colors.black87)),
+        Text(
+          label,
+          style: const TextStyle(fontSize: 14, color: Colors.black87),
+        ),
       ],
     );
   }

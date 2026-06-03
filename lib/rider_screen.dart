@@ -3,7 +3,6 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'logger_service.dart';
 
@@ -42,34 +41,37 @@ class _RiderScreenState extends State<RiderScreen> {
         .doc(name)
         .snapshots()
         .listen((snapshot) {
-        if (_isInternalChange) {
-          LoggerService().log('Ignoro update Firestore (cambio interno)');
-          return;
-        }
-
-        final data = snapshot.data();
-        final serverStatus = data?['status'] as String?;
-        if (serverStatus != null && serverStatus != _currentStatus) {
-          LoggerService().log('Sync Firestore -> Local: $serverStatus');
-          // If we are offline on Firestore but local is not, we might need to stop tracking
-          // But usually this listener is for moving from consegna <-> rientro
-          if (serverStatus == 'offline' && _currentStatus != 'offline') {
-             _stopTracking(keepOverlay: true);
-          } else if (serverStatus != 'offline' && _currentStatus != serverStatus) {
-             // If we are switching active statuses
-             if (_isConfigured) {
-               _toggleTracking(serverStatus);
-             }
+          if (_isInternalChange) {
+            LoggerService().log('Ignoro update Firestore (cambio interno)');
+            return;
           }
-        }
-      });
+
+          final data = snapshot.data();
+          final serverStatus = data?['status'] as String?;
+          if (serverStatus != null && serverStatus != _currentStatus) {
+            LoggerService().log('Sync Firestore -> Local: $serverStatus');
+            // If we are offline on Firestore but local is not, we might need to stop tracking
+            // But usually this listener is for moving from consegna <-> rientro
+            if (serverStatus == 'offline' && _currentStatus != 'offline') {
+              _stopTracking(keepOverlay: true);
+            } else if (serverStatus != 'offline' &&
+                _currentStatus != serverStatus) {
+              // If we are switching active statuses
+              if (_isConfigured) {
+                _toggleTracking(serverStatus);
+              }
+            }
+          }
+        });
   }
 
   void _initOverlayListener() {
     LoggerService().log('Inizializzazione Listener Overlay...');
     _overlayListener = FlutterOverlayWindow.overlayListener.listen((event) {
-      LoggerService().log('MESSAGGIO RICEVUTO DALL\'OVERLAY: "$event" (tipo: ${event.runtimeType})');
-      
+      LoggerService().log(
+        'MESSAGGIO RICEVUTO DALL\'OVERLAY: "$event" (tipo: ${event.runtimeType})',
+      );
+
       String? newStatus;
       if (event is String) {
         newStatus = event;
@@ -79,7 +81,9 @@ class _RiderScreenState extends State<RiderScreen> {
 
       if (newStatus != null) {
         if (!_isConfigured) {
-          LoggerService().log('Attenzione: App non ancora configurata, ignoro messaggio.');
+          LoggerService().log(
+            'Attenzione: App non ancora configurata, ignoro messaggio.',
+          );
           return;
         }
 
@@ -99,8 +103,11 @@ class _RiderScreenState extends State<RiderScreen> {
     final prefs = await SharedPreferences.getInstance();
     final savedName = prefs.getString('rider_name');
     final savedPizzeria = prefs.getString('pizzeria_id');
-    
-    if (savedName != null && savedName.isNotEmpty && savedPizzeria != null && savedPizzeria.isNotEmpty) {
+
+    if (savedName != null &&
+        savedName.isNotEmpty &&
+        savedPizzeria != null &&
+        savedPizzeria.isNotEmpty) {
       setState(() {
         _nameController.text = savedName;
         _pizzeriaController.text = savedPizzeria;
@@ -123,12 +130,14 @@ class _RiderScreenState extends State<RiderScreen> {
             overlayContent: "Bolla per cambio stato rapido",
             flag: OverlayFlag.defaultFlag,
             visibility: NotificationVisibility.visibilityPublic,
-            height: 250, 
-            width: 250, 
+            height: 250,
+            width: 250,
           );
         }
       } else {
-        LoggerService().log('Permesso overlay mancante per la bolla persistente.');
+        LoggerService().log(
+          'Permesso overlay mancante per la bolla persistente.',
+        );
       }
     } catch (e) {
       LoggerService().log('Errore avvio bolla persistente: $e');
@@ -138,7 +147,7 @@ class _RiderScreenState extends State<RiderScreen> {
   Future<void> _saveConfiguration() async {
     final name = _nameController.text.trim();
     final pizzeriaId = _pizzeriaController.text.trim().toLowerCase();
-    
+
     if (name.isEmpty || pizzeriaId.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Inserisci nome e codice pizzeria!')),
@@ -152,15 +161,19 @@ class _RiderScreenState extends State<RiderScreen> {
       final bool? granted = await FlutterOverlayWindow.requestPermission();
       if (granted != true) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Permesso "Spostamento sopra altre app" necessario per la bolla!')),
+          const SnackBar(
+            content: Text(
+              'Permesso "Spostamento sopra altre app" necessario per la bolla!',
+            ),
+          ),
         );
       }
     }
-    
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('rider_name', name);
     await prefs.setString('pizzeria_id', pizzeriaId);
-    
+
     setState(() {
       _isConfigured = true;
     });
@@ -220,20 +233,23 @@ class _RiderScreenState extends State<RiderScreen> {
       }
 
       if (permission == LocationPermission.deniedForever) {
-        throw Exception('Permessi GPS negati permanentemente. Abilitali dalle impostazioni.');
+        throw Exception(
+          'Permessi GPS negati permanentemente. Abilitali dalle impostazioni.',
+        );
       }
 
       LoggerService().log('Fermo tracking precedente...');
       await _stopTracking(keepOverlay: true);
 
       late final LocationSettings locationSettings;
-      
+
       if (Theme.of(context).platform == TargetPlatform.android) {
         locationSettings = AndroidSettings(
           accuracy: LocationAccuracy.high,
           distanceFilter: 30,
           foregroundNotificationConfig: const ForegroundNotificationConfig(
-            notificationText: "Il tracking della tua posizione è attivo per la pizzeria.",
+            notificationText:
+                "Il tracking della tua posizione è attivo per la pizzeria.",
             notificationTitle: "Dove Rider: In Servizio",
             enableWakeLock: true,
           ),
@@ -246,30 +262,66 @@ class _RiderScreenState extends State<RiderScreen> {
       }
 
       LoggerService().log('Avvio stream GPS...');
-      _positionStream = Geolocator.getPositionStream(locationSettings: locationSettings).listen(
-        (Position position) {
-          _updateFirestorePosition(pizzeriaId, name, status, position);
-        },
-        onError: (e) {
-          LoggerService().log('Errore Stream GPS: $e');
-        },
-      );
+      _positionStream =
+          Geolocator.getPositionStream(
+            locationSettings: locationSettings,
+          ).listen(
+            (Position position) {
+              _updateFirestorePosition(pizzeriaId, name, status, position);
+            },
+            onError: (e) {
+              LoggerService().log('Errore Stream GPS: $e');
+            },
+          );
 
       LoggerService().log('Ottengo posizione iniziale...');
       Position initialPosition;
       try {
-        initialPosition = await Geolocator.getCurrentPosition(
-          locationSettings: const LocationSettings(accuracy: LocationAccuracy.low),
-        ).timeout(const Duration(seconds: 5), onTimeout: () {
-          LoggerService().log('TIMEOUT GPS! Uso ultima nota.');
-          return Geolocator.getLastKnownPosition().then((val) => val ?? Position(latitude: 0, longitude: 0, timestamp: DateTime.now(), accuracy: 0, altitude: 0, heading: 0, speed: 0, speedAccuracy: 0, altitudeAccuracy: 0, headingAccuracy: 0));
-        });
+        initialPosition =
+            await Geolocator.getCurrentPosition(
+              locationSettings: const LocationSettings(
+                accuracy: LocationAccuracy.low,
+              ),
+            ).timeout(
+              const Duration(seconds: 5),
+              onTimeout: () {
+                LoggerService().log('TIMEOUT GPS! Uso ultima nota.');
+                return Geolocator.getLastKnownPosition().then(
+                  (val) =>
+                      val ??
+                      Position(
+                        latitude: 0,
+                        longitude: 0,
+                        timestamp: DateTime.now(),
+                        accuracy: 0,
+                        altitude: 0,
+                        heading: 0,
+                        speed: 0,
+                        speedAccuracy: 0,
+                        altitudeAccuracy: 0,
+                        headingAccuracy: 0,
+                      ),
+                );
+              },
+            );
       } catch (e) {
         LoggerService().log('Errore GPS iniziale: $e');
-        initialPosition = await Geolocator.getLastKnownPosition() ?? 
-            Position(latitude: 0, longitude: 0, timestamp: DateTime.now(), accuracy: 0, altitude: 0, heading: 0, speed: 0, speedAccuracy: 0, altitudeAccuracy: 0, headingAccuracy: 0);
+        initialPosition =
+            await Geolocator.getLastKnownPosition() ??
+            Position(
+              latitude: 0,
+              longitude: 0,
+              timestamp: DateTime.now(),
+              accuracy: 0,
+              altitude: 0,
+              heading: 0,
+              speed: 0,
+              speedAccuracy: 0,
+              altitudeAccuracy: 0,
+              headingAccuracy: 0,
+            );
       }
-      
+
       LoggerService().log('Aggiorno Firestore iniziale...');
       if (mounted) {
         setState(() {
@@ -323,13 +375,15 @@ class _RiderScreenState extends State<RiderScreen> {
           LoggerService().log('Errore chiusura overlay: $e');
         }
       }
-      
+
       final String name = _nameController.text.trim();
       final String pizzeriaId = _pizzeriaController.text.trim();
-      
-      if (name.isNotEmpty && pizzeriaId.isNotEmpty && _currentStatus != 'offline') {
+
+      if (name.isNotEmpty &&
+          pizzeriaId.isNotEmpty &&
+          _currentStatus != 'offline') {
         LoggerService().log('Aggiorno Firestore a offline...');
-        
+
         // Aggiorniamo lo stato locale PRIMA della scrittura per evitare loop col listener
         if (mounted) {
           setState(() {
@@ -344,9 +398,9 @@ class _RiderScreenState extends State<RiderScreen> {
               .collection('riders')
               .doc(name)
               .update({
-            'status': 'offline',
-            'timestamp': FieldValue.serverTimestamp(),
-          });
+                'status': 'offline',
+                'timestamp': FieldValue.serverTimestamp(),
+              });
         } catch (e) {
           LoggerService().log('Errore aggiornamento Firestore offline: $e');
         }
@@ -357,7 +411,12 @@ class _RiderScreenState extends State<RiderScreen> {
     }
   }
 
-  Future<void> _updateFirestorePosition(String pizzeriaId, String name, String status, Position position) async {
+  Future<void> _updateFirestorePosition(
+    String pizzeriaId,
+    String name,
+    String status,
+    Position position,
+  ) async {
     try {
       await _firestore
           .collection('pizzerie')
@@ -365,13 +424,15 @@ class _RiderScreenState extends State<RiderScreen> {
           .collection('riders')
           .doc(name)
           .set({
-        'name': name,
-        'status': status,
-        'lat': position.latitude,
-        'lng': position.longitude,
-        'timestamp': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-      LoggerService().log('Posizione aggiornata ($pizzeriaId - $name): ${position.latitude}, ${position.longitude}');
+            'name': name,
+            'status': status,
+            'lat': position.latitude,
+            'lng': position.longitude,
+            'timestamp': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
+      LoggerService().log(
+        'Posizione aggiornata ($pizzeriaId - $name): ${position.latitude}, ${position.longitude}',
+      );
     } catch (e) {
       LoggerService().log('Errore aggiornamento Firestore ($pizzeriaId): $e');
     }
@@ -384,7 +445,10 @@ class _RiderScreenState extends State<RiderScreen> {
     return Scaffold(
       backgroundColor: Colors.grey[50],
       appBar: AppBar(
-        title: const Text('Area Rider', style: TextStyle(fontWeight: FontWeight.bold)),
+        title: const Text(
+          'Area Rider',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
         elevation: 0,
         backgroundColor: Colors.transparent,
         foregroundColor: Colors.black,
@@ -399,15 +463,23 @@ class _RiderScreenState extends State<RiderScreen> {
                   context: context,
                   builder: (context) => AlertDialog(
                     title: const Text('Configurazione'),
-                    content: const Text('Vuoi resettare il nome e il codice pizzeria?'),
+                    content: const Text(
+                      'Vuoi resettare il nome e il codice pizzeria?',
+                    ),
                     actions: [
-                      TextButton(onPressed: () => Navigator.pop(context), child: const Text('ANNULLA')),
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('ANNULLA'),
+                      ),
                       TextButton(
                         onPressed: () {
                           _resetConfiguration();
                           Navigator.pop(context);
                         },
-                        child: const Text('RESET', style: TextStyle(color: Colors.red)),
+                        child: const Text(
+                          'RESET',
+                          style: TextStyle(color: Colors.red),
+                        ),
                       ),
                     ],
                   ),
@@ -426,19 +498,22 @@ class _RiderScreenState extends State<RiderScreen> {
               Text(
                 _isConfigured ? 'Ciao, ${_nameController.text}!' : 'Benvenuto!',
                 style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                      fontWeight: FontWeight.bold,
-                      color: Colors.black87,
-                    ),
+                  fontWeight: FontWeight.bold,
+                  color: Colors.black87,
+                ),
               ),
               Text(
-                _isConfigured 
-                  ? 'Pizzeria: ${_pizzeriaController.text}'
-                  : 'Configura l\'app per iniziare.',
+                _isConfigured
+                    ? 'Pizzeria: ${_pizzeriaController.text}'
+                    : 'Configura l\'app per iniziare.',
                 style: const TextStyle(color: Colors.grey, fontSize: 16),
               ),
               const SizedBox(height: 40),
-              
-              if (!_isConfigured) _buildConfigurationInput() else _buildTrackingControls(isTracking),
+
+              if (!_isConfigured)
+                _buildConfigurationInput()
+              else
+                _buildTrackingControls(isTracking),
             ],
           ),
         ),
@@ -472,10 +547,15 @@ class _RiderScreenState extends State<RiderScreen> {
               style: ElevatedButton.styleFrom(
                 backgroundColor: Theme.of(context).colorScheme.primary,
                 foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
                 elevation: 2,
               ),
-              child: const Text('CONFERMA CONFIGURAZIONE', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              child: const Text(
+                'CONFERMA CONFIGURAZIONE',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
             ),
           ),
         ],
@@ -519,8 +599,9 @@ class _RiderScreenState extends State<RiderScreen> {
   }
 
   Widget _buildTrackingControls(bool isTracking) {
-    if (_isLoading) return const Expanded(child: Center(child: CircularProgressIndicator()));
-    
+    if (_isLoading)
+      return const Expanded(child: Center(child: CircularProgressIndicator()));
+
     return Expanded(
       child: Column(
         children: [
@@ -553,11 +634,16 @@ class _RiderScreenState extends State<RiderScreen> {
                   icon: const Icon(Icons.stop_circle, color: Colors.red),
                   label: const Text(
                     'TERMINA TURNO',
-                    style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+                    style: TextStyle(
+                      color: Colors.red,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                   style: TextButton.styleFrom(
                     backgroundColor: Colors.red.withOpacity(0.1),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
                   ),
                 ),
               ),
@@ -594,7 +680,7 @@ class _RiderScreenState extends State<RiderScreen> {
                     color: color.withOpacity(0.3),
                     blurRadius: 15,
                     offset: const Offset(0, 8),
-                  )
+                  ),
                 ]
               : [],
         ),
@@ -603,14 +689,12 @@ class _RiderScreenState extends State<RiderScreen> {
             Container(
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
-                color: active ? Colors.white.withOpacity(0.2) : color.withOpacity(0.1),
+                color: active
+                    ? Colors.white.withOpacity(0.2)
+                    : color.withOpacity(0.1),
                 shape: BoxShape.circle,
               ),
-              child: Icon(
-                icon,
-                color: active ? Colors.white : color,
-                size: 32,
-              ),
+              child: Icon(icon, color: active ? Colors.white : color, size: 32),
             ),
             const SizedBox(width: 20),
             Expanded(
@@ -629,7 +713,9 @@ class _RiderScreenState extends State<RiderScreen> {
                     subtitle,
                     style: TextStyle(
                       fontSize: 13,
-                      color: active ? Colors.white.withOpacity(0.8) : Colors.black54,
+                      color: active
+                          ? Colors.white.withOpacity(0.8)
+                          : Colors.black54,
                     ),
                   ),
                 ],
