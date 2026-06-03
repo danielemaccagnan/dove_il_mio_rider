@@ -3,6 +3,7 @@ import 'dart:ui' as ui;
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'logger_service.dart';
@@ -14,7 +15,8 @@ class ManagerScreen extends StatefulWidget {
   State<ManagerScreen> createState() => _ManagerScreenState();
 }
 
-class _ManagerScreenState extends State<ManagerScreen> {
+class _ManagerScreenState extends State<ManagerScreen>
+    with SingleTickerProviderStateMixin {
   // Como, Italy coordinates
   static const CameraPosition _comoPosition = CameraPosition(
     target: LatLng(45.8081, 9.0852),
@@ -31,10 +33,62 @@ class _ManagerScreenState extends State<ManagerScreen> {
   bool _isConfigured = false;
   bool _isLoading = true;
 
+  // --- Animazione marker ---
+  // Ogni rider mantiene posizione mostrata + posizione obiettivo (da Firestore).
+  // Un Ticker (60fps) interpola la posizione mostrata verso l'obiettivo, così
+  // il pallino "scivola" in modo lineare invece di saltare ad ogni update.
+  final Map<String, _RiderMarker> _riders = {};
+  late final Ticker _ticker;
+  // Durata dell'animazione = circa l'intervallo con cui il rider scrive (5s),
+  // così il movimento è continuo e quasi lineare.
+  static const Duration _animDuration = Duration(seconds: 5);
+  // Limita gli aggiornamenti dei marker sulla mappa a ~30fps (basta e avanza,
+  // e alleggerisce il canale nativo di Google Maps).
+  Duration _lastRebuild = Duration.zero;
+
   @override
   void initState() {
     super.initState();
+    _ticker = createTicker(_onTick);
     _loadConfiguration();
+  }
+
+  /// Chiamato ad ogni frame mentre almeno un rider si sta muovendo.
+  void _onTick(Duration elapsed) {
+    bool anyMoving = false;
+    for (final r in _riders.values) {
+      r.updateInterpolated();
+      if (r.isMoving) anyMoving = true;
+    }
+    // Throttle a ~30fps per non sovraccaricare la mappa nativa.
+    if (elapsed - _lastRebuild >= const Duration(milliseconds: 33) || !anyMoving) {
+      _lastRebuild = elapsed;
+      _rebuildMarkers();
+    }
+    if (!anyMoving) {
+      _ticker.stop();
+    }
+  }
+
+  /// Costruisce il set di marker dalle posizioni interpolate correnti.
+  void _rebuildMarkers() {
+    if (!mounted) return;
+    final markers = <Marker>{};
+    _riders.forEach((id, r) {
+      markers.add(
+        Marker(
+          markerId: MarkerId(id),
+          position: r.currentPos,
+          infoWindow: InfoWindow(
+            title: r.name,
+            snippet: 'Stato: ${r.status.toUpperCase()}',
+          ),
+          icon: r.icon,
+          anchor: const Offset(0.5, 1.0),
+        ),
+      );
+    });
+    _markersNotifier.value = markers;
   }
 
   Future<void> _loadConfiguration() async {
@@ -65,7 +119,8 @@ class _ManagerScreenState extends State<ManagerScreen> {
   }
 
   Future<void> _updateMarkers(List<QueryDocumentSnapshot> docs) async {
-    final Set<Marker> newMarkers = {};
+    final Set<String> seenIds = {};
+    bool needsTicker = false;
 
     for (var doc in docs) {
       final data = doc.data() as Map<String, dynamic>;
@@ -73,41 +128,50 @@ class _ManagerScreenState extends State<ManagerScreen> {
       final String status = data['status'] ?? 'unknown';
       final double? lat = (data['lat'] as num?)?.toDouble();
       final double? lng = (data['lng'] as num?)?.toDouble();
+      if (lat == null || lng == null) continue;
 
-      if (lat != null && lng != null) {
-        final Color color = status == 'consegna' ? Colors.green : Colors.orange;
+      seenIds.add(doc.id);
+      final LatLng target = LatLng(lat, lng);
+      final Color color = status == 'consegna' ? Colors.green : Colors.orange;
 
-        // Cache key includes status to detect changes
-        final String statusKey = '${name}_$status';
+      // Icona: la rigeneriamo solo se nome o stato sono cambiati.
+      final String statusKey = '${name}_$status';
+      BitmapDescriptor icon;
+      if (_riderStatusCache[doc.id] != statusKey ||
+          !_descriptorCache.containsKey(statusKey)) {
+        icon = await _createCustomMarker(name, color);
+        _riderStatusCache[doc.id] = statusKey;
+        _descriptorCache[statusKey] = icon;
+      } else {
+        icon = _descriptorCache[statusKey]!;
+      }
 
-        BitmapDescriptor icon;
-        // Only regenerate descriptor if name or status changed
-        if (_riderStatusCache[doc.id] != statusKey ||
-            !_descriptorCache.containsKey(statusKey)) {
-          icon = await _createCustomMarker(name, color);
-          _riderStatusCache[doc.id] = statusKey;
-          _descriptorCache[statusKey] = icon;
-        } else {
-          icon = _descriptorCache[statusKey]!;
-        }
-
-        newMarkers.add(
-          Marker(
-            markerId: MarkerId(doc.id),
-            position: LatLng(lat, lng),
-            infoWindow: InfoWindow(
-              title: name,
-              snippet: 'Stato: ${status.toUpperCase()}',
-            ),
-            icon: icon,
-            anchor: const Offset(0.5, 1.0), // Better positioning
-          ),
+      final existing = _riders[doc.id];
+      if (existing == null) {
+        // Nuovo rider: appare subito nella sua posizione (senza animazione).
+        _riders[doc.id] = _RiderMarker(
+          name: name,
+          status: status,
+          icon: icon,
+          position: target,
         );
+      } else {
+        existing.name = name;
+        existing.status = status;
+        existing.icon = icon;
+        // Anima dalla posizione mostrata ora verso la nuova posizione.
+        existing.animateTo(target, _animDuration);
+        needsTicker = true;
       }
     }
 
-    if (mounted) {
-      _markersNotifier.value = newMarkers;
+    // Rimuovi i rider non più presenti (andati offline).
+    _riders.removeWhere((id, _) => !seenIds.contains(id));
+
+    _rebuildMarkers(); // riflette subito nuovi rider / rimozioni
+    if (needsTicker && !_ticker.isActive) {
+      _lastRebuild = Duration.zero;
+      _ticker.start();
     }
   }
 
@@ -133,6 +197,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
 
   Future<void> _resetConfiguration() async {
     _riderSubscription?.cancel();
+    if (_ticker.isActive) _ticker.stop();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('pizzeria_id');
     setState(() {
@@ -141,6 +206,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
       _pizzeriaController.clear();
       _descriptorCache.clear();
       _riderStatusCache.clear();
+      _riders.clear();
       _markersNotifier.value = {};
     });
   }
@@ -211,6 +277,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
 
   @override
   void dispose() {
+    _ticker.dispose();
     _riderSubscription?.cancel();
     _pizzeriaController.dispose();
     _markersNotifier.dispose();
@@ -502,6 +569,56 @@ class _ManagerScreenState extends State<ManagerScreen> {
           style: const TextStyle(fontSize: 14, color: Colors.black87),
         ),
       ],
+    );
+  }
+}
+
+/// Stato di un rider sulla mappa, con animazione fluida tra una posizione e
+/// l'altra. `currentPos` è la posizione MOSTRATA (interpolata), `targetPos` è
+/// l'ultima posizione ricevuta da Firestore.
+class _RiderMarker {
+  String name;
+  String status;
+  BitmapDescriptor icon;
+  LatLng startPos; // da dove parte l'animazione corrente
+  LatLng targetPos; // dove deve arrivare (ultima posizione reale)
+  LatLng currentPos; // posizione mostrata ora
+  DateTime _animStart;
+  Duration _animDuration;
+
+  _RiderMarker({
+    required this.name,
+    required this.status,
+    required this.icon,
+    required LatLng position,
+  })  : startPos = position,
+        targetPos = position,
+        currentPos = position,
+        _animStart = DateTime.now(),
+        _animDuration = const Duration(milliseconds: 1);
+
+  /// Avvia una nuova animazione: dalla posizione mostrata ora verso [newTarget].
+  void animateTo(LatLng newTarget, Duration duration) {
+    startPos = currentPos;
+    targetPos = newTarget;
+    _animStart = DateTime.now();
+    _animDuration = duration;
+  }
+
+  /// Vero finché l'animazione non è arrivata a destinazione.
+  bool get isMoving {
+    final elapsed = DateTime.now().difference(_animStart).inMilliseconds;
+    return elapsed < _animDuration.inMilliseconds;
+  }
+
+  /// Ricalcola `currentPos` interpolando linearmente start -> target nel tempo.
+  void updateInterpolated() {
+    final elapsedMs = DateTime.now().difference(_animStart).inMilliseconds;
+    final durMs = _animDuration.inMilliseconds;
+    final double t = durMs <= 0 ? 1.0 : (elapsedMs / durMs).clamp(0.0, 1.0);
+    currentPos = LatLng(
+      startPos.latitude + (targetPos.latitude - startPos.latitude) * t,
+      startPos.longitude + (targetPos.longitude - startPos.longitude) * t,
     );
   }
 }
