@@ -39,6 +39,11 @@ class _RiderScreenState extends State<RiderScreen>
   // chiamate all'overlay, che altrimenti lancerebbero MissingPluginException.
   bool get _overlaySupported => defaultTargetPlatform == TargetPlatform.android;
 
+  // La bolla è una funzione OPZIONALE: il rider la attiva se vuole. Se il suo
+  // telefono non concede il permesso, l'app funziona lo stesso (pulsanti
+  // in-app). Non viene mai forzata né blocca nulla.
+  bool _bubbleEnabled = false;
+
   @override
   void initState() {
     super.initState();
@@ -49,9 +54,9 @@ class _RiderScreenState extends State<RiderScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Quando l'utente torna nell'app (es. dopo aver concesso il permesso
-    // overlay dalle impostazioni di sistema), riproviamo a mostrare la bolla.
-    if (state == AppLifecycleState.resumed && _isConfigured) {
+    // Se il rider ha attivato la bolla, quando torna nell'app riproviamo a
+    // mostrarla (es. dopo aver concesso il permesso dalle impostazioni).
+    if (state == AppLifecycleState.resumed && _isConfigured && _bubbleEnabled) {
       _ensureOverlayIsShown();
     }
   }
@@ -128,6 +133,7 @@ class _RiderScreenState extends State<RiderScreen>
     final prefs = await SharedPreferences.getInstance();
     final savedName = prefs.getString('rider_name');
     final savedPizzeria = prefs.getString('pizzeria_id');
+    final bubbleEnabled = prefs.getBool('bubble_enabled') ?? false;
 
     if (savedName != null &&
         savedName.isNotEmpty &&
@@ -137,9 +143,11 @@ class _RiderScreenState extends State<RiderScreen>
         _nameController.text = savedName;
         _pizzeriaController.text = savedPizzeria;
         _isConfigured = true;
+        _bubbleEnabled = bubbleEnabled;
       });
       _initStatusListener(savedPizzeria, savedName);
-      _ensureOverlayIsShown();
+      // La bolla parte solo se il rider l'aveva attivata.
+      if (_bubbleEnabled) _ensureOverlayIsShown();
     }
   }
 
@@ -167,6 +175,59 @@ class _RiderScreenState extends State<RiderScreen>
       }
     } catch (e) {
       LoggerService().log('Errore avvio bolla persistente: $e');
+    }
+  }
+
+  /// Attiva/disattiva la bolla galleggiante su richiesta del rider (opzionale).
+  /// Se il telefono non concede il permesso, l'app continua a funzionare
+  /// normalmente con i pulsanti in-app.
+  Future<void> _toggleBubble() async {
+    if (!_overlaySupported) return;
+    final prefs = await SharedPreferences.getInstance();
+
+    if (_bubbleEnabled) {
+      // Disattiva
+      await prefs.setBool('bubble_enabled', false);
+      try {
+        await FlutterOverlayWindow.closeOverlay();
+      } catch (_) {}
+      if (mounted) {
+        setState(() => _bubbleEnabled = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Bolla disattivata.')),
+        );
+      }
+      return;
+    }
+
+    // Attiva: salviamo subito l'intenzione, così se l'utente concede il
+    // permesso dalle impostazioni e poi torna, la bolla parte da sola.
+    await prefs.setBool('bubble_enabled', true);
+    if (mounted) setState(() => _bubbleEnabled = true);
+
+    final bool granted = await FlutterOverlayWindow.isPermissionGranted();
+    if (granted) {
+      await _ensureOverlayIsShown();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Bolla attivata.')),
+        );
+      }
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Concedi "Sopra altre app" per la bolla (opzionale), poi torna qui.',
+            ),
+            duration: Duration(seconds: 4),
+          ),
+        );
+      }
+      try {
+        await FlutterOverlayWindow.requestPermission();
+      } catch (_) {}
+      // Al ritorno nell'app il ciclo di vita riproverà a mostrarla.
     }
   }
 
@@ -202,23 +263,9 @@ class _RiderScreenState extends State<RiderScreen>
       );
     }
 
-    // Permesso bolla (solo Android: su iOS la bolla non esiste).
-    if (_overlaySupported) {
-      final bool status = await FlutterOverlayWindow.isPermissionGranted();
-      if (!status) {
-        final bool? granted = await FlutterOverlayWindow.requestPermission();
-        if (granted != true && mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                'Permesso "Spostamento sopra altre app" necessario per la bolla!',
-              ),
-            ),
-          );
-        }
-      }
-    }
-
+    // NB: il permesso della bolla NON viene chiesto qui. La bolla è opzionale
+    // e si attiva solo se il rider lo decide (interruttore in alto). Così la
+    // configurazione non impone permessi "spaventosi" e l'app funziona su tutti.
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('rider_name', name);
     await prefs.setString('pizzeria_id', pizzeriaId);
@@ -227,7 +274,6 @@ class _RiderScreenState extends State<RiderScreen>
       _isConfigured = true;
     });
     _initStatusListener(pizzeriaId, name);
-    _ensureOverlayIsShown();
   }
 
   Future<void> _resetConfiguration() async {
@@ -247,6 +293,7 @@ class _RiderScreenState extends State<RiderScreen>
         _isConfigured = false;
         _currentStatus = 'offline';
         _isLoading = false;
+        _bubbleEnabled = false;
         _nameController.clear();
         _pizzeriaController.clear();
       });
@@ -283,6 +330,7 @@ class _RiderScreenState extends State<RiderScreen>
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove('rider_name');
       await prefs.remove('pizzeria_id');
+      await prefs.remove('bubble_enabled');
       await prefs.setString('rider_status', 'offline');
     } catch (e) {
       LoggerService().log('Errore rimozione prefs durante reset: $e');
@@ -612,6 +660,22 @@ class _RiderScreenState extends State<RiderScreen>
         foregroundColor: Colors.black,
         centerTitle: true,
         actions: [
+          // Interruttore bolla (solo Android, solo se configurato). Opzionale.
+          if (_overlaySupported && _isConfigured)
+            IconButton(
+              icon: Icon(
+                _bubbleEnabled
+                    ? Icons.bubble_chart
+                    : Icons.bubble_chart_outlined,
+                color: _bubbleEnabled
+                    ? Theme.of(context).colorScheme.primary
+                    : Colors.grey,
+              ),
+              tooltip: _bubbleEnabled
+                  ? 'Disattiva bolla'
+                  : 'Attiva bolla (opzionale)',
+              onPressed: _toggleBubble,
+            ),
           IconButton(
             icon: const Icon(Icons.bug_report_outlined),
             tooltip: 'Log di debug',
