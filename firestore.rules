@@ -1,0 +1,41 @@
+rules_version = '2';
+
+// Regole di sicurezza Firestore per "Dove il mio Rider".
+// Blindano l'accesso a livello database: i dati di una pizzeria sono
+// leggibili/scrivibili SOLO se quella pizzeria è nella lista degli autorizzati
+// ed è attiva. Impossibile da aggirare modificando l'app.
+//
+// Come pubblicarle: console Firebase -> Firestore Database -> scheda "Regole"
+// -> incolla tutto questo -> "Pubblica".
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Una pizzeria è autorizzata se esiste nella lista e non è disattivata
+    // (campo active assente o diverso da false).
+    function pizzeriaAutorizzata(code) {
+      return exists(/databases/$(database)/documents/pizzerie_autorizzate/$(code))
+        && get(/databases/$(database)/documents/pizzerie_autorizzate/$(code)).data.get('active', true) != false;
+    }
+
+    // Lista clienti autorizzati: l'app la PUÒ leggere (le serve per il
+    // controllo), ma NESSUNO la può modificare dall'app. La gestisci solo tu
+    // dalla console Firebase (la console scrive ignorando le regole).
+    match /pizzerie_autorizzate/{code} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Dati dei rider di una pizzeria: accessibili SOLO se la pizzeria è
+    // autorizzata e attiva. Vale per il documento pizzeria e per tutte le
+    // sottocollezioni (es. /pizzerie/{code}/riders/{nome}).
+    match /pizzerie/{code} {
+      allow read, write: if pizzeriaAutorizzata(code);
+      match /{document=**} {
+        allow read, write: if pizzeriaAutorizzata(code);
+      }
+    }
+
+    // Tutto il resto è negato per default (sicuro).
+  }
+}
