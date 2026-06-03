@@ -1,15 +1,29 @@
-# Codemagic — build iOS NON firmata, da installare sull'iPhone con Sideloadly
-# (firma con Apple ID gratuito su Windows). Compila l'app combinata (main.dart):
-# una sola app dove scegli "Rider" o "Manager" dalla schermata iniziale.
+# Codemagic — build iOS NON firmate, da installare con Sideloadly (Apple ID
+# gratuito, su Windows, senza Mac).
 #
-# Come usarlo:
-#  1. Vai su https://codemagic.io e accedi gratis con GitHub
-#  2. Aggiungi questo repo, scegli il workflow "ios-unsigned" e avvia il build
-#  3. Scarica l'artifact "app-unsigned.ipa"
-#  4. Su Windows usa Sideloadly per firmarla col tuo Apple ID e installarla
+# Tre workflow:
+#  - ios-rider    -> app del RIDER (come su Android)
+#  - ios-manager  -> app del MANAGER (come su Android)
+#  - ios-unsigned -> app combinata (Rider+Manager in una sola), come fallback
+#
+# Stesso progetto Firebase (trova-il-mio-rider) su tutte: i dati si sincronizzano
+# con l'app Android. Dopo il build, scarica l'IPA e firmalo/installalo con
+# Sideloadly (puoi usare un Bundle ID diverso per ogni app).
+
+definitions:
+  scripts:
+    - &pubget
+      name: Flutter pub get
+      script: flutter pub get
+    - &podinstall
+      name: Pod install
+      script: |
+        cd ios
+        pod install
+
 workflows:
-  ios-unsigned:
-    name: iOS unsigned (per sideload con Sideloadly)
+  ios-rider:
+    name: iOS RIDER (unsigned)
     instance_type: mac_mini_m2
     max_build_duration: 60
     environment:
@@ -17,20 +31,65 @@ workflows:
       xcode: latest
       cocoapods: default
     scripts:
-      - name: Flutter pub get
-        script: flutter pub get
-      - name: Pod install
+      - *pubget
+      - *podinstall
+      - name: Build RIDER (senza firma)
         script: |
-          cd ios
-          pod install
-      - name: Build iOS (senza firma)
-        script: |
-          flutter build ios --release --no-codesign
-      - name: Crea IPA non firmata
+          flutter build ios --release --no-codesign --flavor rider -t lib/main_rider.dart
+      - name: Crea IPA
         script: |
           cd build/ios/iphoneos
+          APP=$(ls -d *.app | head -1)
           mkdir -p Payload
-          cp -R Runner.app Payload/Runner.app
+          cp -R "$APP" Payload/
+          zip -r app-rider-unsigned.ipa Payload
+    artifacts:
+      - build/ios/iphoneos/app-rider-unsigned.ipa
+
+  ios-manager:
+    name: iOS MANAGER (unsigned)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - *pubget
+      - *podinstall
+      - name: Build MANAGER (senza firma)
+        script: |
+          flutter build ios --release --no-codesign --flavor manager -t lib/main_manager.dart
+      - name: Crea IPA
+        script: |
+          cd build/ios/iphoneos
+          APP=$(ls -d *.app | head -1)
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r app-manager-unsigned.ipa Payload
+    artifacts:
+      - build/ios/iphoneos/app-manager-unsigned.ipa
+
+  ios-unsigned:
+    name: iOS combinata (unsigned)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - *pubget
+      - *podinstall
+      - name: Build combinata (senza firma)
+        script: |
+          flutter build ios --release --no-codesign
+      - name: Crea IPA
+        script: |
+          cd build/ios/iphoneos
+          APP=$(ls -d *.app | head -1)
+          mkdir -p Payload
+          cp -R "$APP" Payload/
           zip -r app-unsigned.ipa Payload
     artifacts:
       - build/ios/iphoneos/app-unsigned.ipa
