@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'logger_service.dart';
@@ -11,17 +12,40 @@ Future<void> main() async {
     WidgetsFlutterBinding.ensureInitialized();
     await LoggerService().init();
     await LoggerService().log("App avviata");
-    
+
+    bool firebaseOk = false;
     try {
       await Firebase.initializeApp();
+      firebaseOk = true;
       await LoggerService().log("Firebase inizializzato correttamente");
     } catch (e, stack) {
       await LoggerService().log("Errore inizializzazione Firebase: $e\n$stack");
     }
-    
+
+    FlutterError.onError = (FlutterErrorDetails details) {
+      FlutterError.presentError(details);
+      if (firebaseOk) {
+        FirebaseCrashlytics.instance.recordFlutterFatalError(details);
+      }
+      LoggerService().log(
+        "FLUTTER ERROR: ${details.exceptionAsString()}\n${details.stack}",
+      );
+    };
+
+    WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
+      if (firebaseOk) {
+        FirebaseCrashlytics.instance.recordError(error, stack, fatal: true);
+      }
+      LoggerService().log("PLATFORM ERROR: $error\n$stack");
+      return true;
+    };
+
     runApp(const MyApp());
   }, (error, stack) {
-     LoggerService().log("ERRORE GLOBALE: $error\n$stack");
+    try {
+      FirebaseCrashlytics.instance.recordError(error, stack, fatal: true);
+    } catch (_) {}
+    LoggerService().log("ERRORE GLOBALE: $error\n$stack");
   });
 }
 
