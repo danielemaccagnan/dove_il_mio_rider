@@ -1,7 +1,7 @@
 import 'dart:async';
-import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:flutter/material.dart';
+import 'firebase_ios_options.dart';
 import 'logger_service.dart';
 import 'manager_screen.dart';
 
@@ -12,7 +12,7 @@ Future<void> main() async {
 
     bool firebaseOk = false;
     try {
-      await Firebase.initializeApp();
+      await initFirebaseCrossPlatform();
       firebaseOk = true;
     } catch (e, stack) {
       await LoggerService().log("Errore inizializzazione Firebase: $e\n$stack");
