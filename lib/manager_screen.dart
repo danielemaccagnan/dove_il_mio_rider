@@ -60,6 +60,20 @@ class _ManagerScreenState extends State<ManagerScreen>
   static const double _avgSpeedKmh = 25; // velocità media realistica in città
   static const double _roadFactor = 1.4; // le strade non sono in linea d'aria
 
+  // --- Rider fantasma ---
+  // Un rider scrive su Firestore solo quando si muove. Se non si aggiorna da
+  // oltre questo tempo è "fermo fermo" (o scollegato/batteria scarica): lo
+  // nascondiamo. Riappare appena torna a muoversi.
+  static const Duration _staleThreshold = Duration(minutes: 10);
+  Timer? _freshnessTimer; // ricontrolla periodicamente chi è scaduto
+
+  // --- Stile marker in base allo zoom ---
+  // Da lontano (zoom basso) i nomi grandi si coprono: mostriamo pallini.
+  // Avvicinandosi compaiono i nomi.
+  static const double _labelZoomThreshold = 14;
+  bool _showLabels = false;
+  final Map<String, BitmapDescriptor> _dotIcons = {}; // colore -> pallino
+
   @override
   void initState() {
     super.initState();
@@ -84,11 +98,19 @@ class _ManagerScreenState extends State<ManagerScreen>
     }
   }
 
-  /// Costruisce il set di marker dalle posizioni interpolate correnti.
+  /// Un rider è "fantasma" se non si aggiorna da più di _staleThreshold.
+  bool _isStale(_RiderMarker r) =>
+      DateTime.now().difference(r.lastUpdate) > _staleThreshold;
+
+  /// Costruisce il set di marker dalle posizioni interpolate correnti,
+  /// nascondendo i rider fermi da troppo e scegliendo l'icona in base allo zoom.
   void _rebuildMarkers() {
     if (!mounted) return;
     final markers = <Marker>{};
     _riders.forEach((id, r) {
+      if (_isStale(r)) return; // rider fermo/scollegato da troppo: nascosto
+      final dot = _dotIcons[r.status == 'consegna' ? 'consegna' : 'rientro'];
+      final BitmapDescriptor icon = _showLabels ? r.icon : (dot ?? r.icon);
       markers.add(
         Marker(
           markerId: MarkerId(id),
@@ -97,12 +119,44 @@ class _ManagerScreenState extends State<ManagerScreen>
             title: r.name,
             snippet: 'Stato: ${r.status.toUpperCase()}',
           ),
-          icon: r.icon,
-          anchor: const Offset(0.5, 1.0),
+          icon: icon,
+          // Nome: punta in basso. Pallino: centrato.
+          anchor:
+              _showLabels ? const Offset(0.5, 1.0) : const Offset(0.5, 0.5),
         ),
       );
     });
     _markersNotifier.value = markers;
+  }
+
+  /// Genera (una volta) i pallini colorati usati da lontano.
+  Future<void> _ensureDotIcons() async {
+    if (_dotIcons.isNotEmpty) return;
+    _dotIcons['consegna'] = await _createDotMarker(Colors.green);
+    _dotIcons['rientro'] = await _createDotMarker(Colors.orange);
+  }
+
+  Future<BitmapDescriptor> _createDotMarker(Color color) async {
+    const double size = 44;
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    const center = Offset(size / 2, size / 2);
+    canvas.drawCircle(center, size / 2, Paint()..color = Colors.white);
+    canvas.drawCircle(center, size / 2 - 4, Paint()..color = color);
+    final img = await recorder.endRecording().toImage(size.toInt(), size.toInt());
+    final bytes = await img.toByteData(format: ui.ImageByteFormat.png);
+    return BitmapDescriptor.bytes(bytes!.buffer.asUint8List());
+  }
+
+  /// Ricontrolla periodicamente la "freschezza" dei rider: chi è fermo da oltre
+  /// _staleThreshold sparisce anche se Firestore non manda nuovi eventi (perché
+  /// un rider fermo non scrive). Si riaccende da solo quando il rider si muove.
+  void _startFreshnessTimer() {
+    _freshnessTimer ??= Timer.periodic(const Duration(seconds: 30), (_) {
+      if (!mounted) return;
+      _rebuildMarkers();
+      _ridersVersion.value++;
+    });
   }
 
   Future<void> _loadConfiguration() async {
@@ -187,6 +241,8 @@ class _ManagerScreenState extends State<ManagerScreen>
   }
 
   Future<void> _updateMarkers(List<QueryDocumentSnapshot> docs) async {
+    await _ensureDotIcons();
+    _startFreshnessTimer();
     final Set<String> seenIds = {};
     bool needsTicker = false;
 
@@ -201,6 +257,9 @@ class _ManagerScreenState extends State<ManagerScreen>
       seenIds.add(doc.id);
       final LatLng target = LatLng(lat, lng);
       final Color color = status == 'consegna' ? Colors.green : Colors.orange;
+      // Quando il rider ha aggiornato l'ultima volta (per il timeout fantasma).
+      final ts = data['timestamp'];
+      final DateTime lastUpdate = ts is Timestamp ? ts.toDate() : DateTime.now();
 
       // Icona: la rigeneriamo solo se nome o stato sono cambiati.
       final String statusKey = '${name}_$status';
@@ -222,14 +281,23 @@ class _ManagerScreenState extends State<ManagerScreen>
           status: status,
           icon: icon,
           position: target,
+          lastUpdate: lastUpdate,
         );
       } else {
+        final bool wasStale = _isStale(existing);
         existing.name = name;
         existing.status = status;
         existing.icon = icon;
-        // Anima dalla posizione mostrata ora verso la nuova posizione.
-        existing.animateTo(target, _animDuration);
-        needsTicker = true;
+        existing.lastUpdate = lastUpdate;
+        if (wasStale) {
+          // Era nascosto (fermo da troppo): riappare subito nel punto giusto,
+          // senza scivolare da lontano.
+          existing.snapTo(target);
+        } else {
+          // Anima dalla posizione mostrata ora verso la nuova posizione.
+          existing.animateTo(target, _animDuration);
+          needsTicker = true;
+        }
       }
     }
 
@@ -318,6 +386,8 @@ class _ManagerScreenState extends State<ManagerScreen>
   Future<void> _resetConfiguration() async {
     _riderSubscription?.cancel();
     _authSubscription?.cancel();
+    _freshnessTimer?.cancel();
+    _freshnessTimer = null;
     if (_ticker.isActive) _ticker.stop();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('pizzeria_id');
@@ -412,11 +482,13 @@ class _ManagerScreenState extends State<ManagerScreen>
         return ValueListenableBuilder<int>(
           valueListenable: _ridersVersion,
           builder: (context, _, _) {
-            final consegna =
-                _riders.values.where((r) => r.status == 'consegna').toList()
-                  ..sort((a, b) => a.name.compareTo(b.name));
-            final rientro =
-                _riders.values.where((r) => r.status == 'rientro').toList();
+            final consegna = _riders.values
+                .where((r) => r.status == 'consegna' && !_isStale(r))
+                .toList()
+              ..sort((a, b) => a.name.compareTo(b.name));
+            final rientro = _riders.values
+                .where((r) => r.status == 'rientro' && !_isStale(r))
+                .toList();
             // I rientranti ordinati per ETA crescente (prima chi arriva prima).
             rientro.sort((a, b) {
               final ea = _etaMinutes(a.targetPos) ?? 9999;
@@ -584,6 +656,7 @@ class _ManagerScreenState extends State<ManagerScreen>
     _ticker.dispose();
     _riderSubscription?.cancel();
     _authSubscription?.cancel();
+    _freshnessTimer?.cancel();
     _pizzeriaController.dispose();
     _markersNotifier.dispose();
     _ridersVersion.dispose();
@@ -668,6 +741,16 @@ class _ManagerScreenState extends State<ManagerScreen>
                       LoggerService().log(
                         'Google Map creata per pizzeria $_pizzeriaId',
                       );
+                    },
+                    onCameraMove: (pos) {
+                      // Da vicino mostra i nomi, da lontano i pallini. Ridisegna
+                      // i marker solo quando si supera la soglia (non ad ogni
+                      // micro-movimento della camera).
+                      final bool show = pos.zoom >= _labelZoomThreshold;
+                      if (show != _showLabels) {
+                        _showLabels = show;
+                        _rebuildMarkers();
+                      }
                     },
                   ),
 
@@ -894,6 +977,7 @@ class _RiderMarker {
   LatLng startPos; // da dove parte l'animazione corrente
   LatLng targetPos; // dove deve arrivare (ultima posizione reale)
   LatLng currentPos; // posizione mostrata ora
+  DateTime lastUpdate; // ultimo aggiornamento posizione (da Firestore)
   DateTime _animStart;
   Duration _animDuration;
 
@@ -902,6 +986,7 @@ class _RiderMarker {
     required this.status,
     required this.icon,
     required LatLng position,
+    required this.lastUpdate,
   })  : startPos = position,
         targetPos = position,
         currentPos = position,
@@ -914,6 +999,16 @@ class _RiderMarker {
     targetPos = newTarget;
     _animStart = DateTime.now();
     _animDuration = duration;
+  }
+
+  /// Posiziona subito il marker senza animazione (usato quando un rider
+  /// riappare dopo essere stato nascosto: non deve "scivolare" da lontano).
+  void snapTo(LatLng pos) {
+    startPos = pos;
+    targetPos = pos;
+    currentPos = pos;
+    _animStart = DateTime.now();
+    _animDuration = const Duration(milliseconds: 1);
   }
 
   /// Vero finché l'animazione non è arrivata a destinazione.
