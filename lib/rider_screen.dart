@@ -28,6 +28,16 @@ class _RiderScreenState extends State<RiderScreen>
   StreamSubscription? _statusSubscription;
   bool _isInternalChange = false;
 
+  // Aggiornamento posizione "fluido" ma a basso costo:
+  // - il GPS aggiorna _lastKnownPosition in memoria (gratis)
+  // - un timer scrive su Firestore ogni _updateInterval SOLO se il rider si è
+  //   spostato (>= _minMovementMeters), così da fermo non spreca scritture.
+  Position? _lastKnownPosition;
+  Position? _lastWrittenPosition;
+  Timer? _positionUpdateTimer;
+  static const Duration _updateInterval = Duration(seconds: 5);
+  static const double _minMovementMeters = 3;
+
   // Token di generazione: ogni operazione di avvio tracking ne prende uno.
   // Se parte un'altra operazione (stop, reset, altro toggle) il token cambia
   // e l'operazione "vecchia" si annulla invece di re-impostare lo stato.
@@ -301,6 +311,10 @@ class _RiderScreenState extends State<RiderScreen>
     LoggerService().log('Tornato alla schermata di configurazione.');
 
     // 2) Cleanup "best effort": non deve mai bloccare il ritorno alla schermata.
+    _positionUpdateTimer?.cancel();
+    _positionUpdateTimer = null;
+    _lastKnownPosition = null;
+    _lastWrittenPosition = null;
     try {
       await _positionStream?.cancel().timeout(const Duration(seconds: 2));
     } catch (e) {
@@ -360,6 +374,7 @@ class _RiderScreenState extends State<RiderScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _positionUpdateTimer?.cancel();
     _positionStream?.cancel();
     _overlayListener?.cancel();
     _nameController.dispose();
@@ -427,7 +442,7 @@ class _RiderScreenState extends State<RiderScreen>
       if (defaultTargetPlatform == TargetPlatform.android) {
         locationSettings = AndroidSettings(
           accuracy: LocationAccuracy.high,
-          distanceFilter: 30,
+          distanceFilter: 10,
           foregroundNotificationConfig: const ForegroundNotificationConfig(
             notificationText:
                 "Il tracking della tua posizione è attivo per la pizzeria.",
@@ -438,7 +453,7 @@ class _RiderScreenState extends State<RiderScreen>
       } else {
         locationSettings = const LocationSettings(
           accuracy: LocationAccuracy.high,
-          distanceFilter: 30,
+          distanceFilter: 10,
         );
       }
 
@@ -457,18 +472,44 @@ class _RiderScreenState extends State<RiderScreen>
         locationSettings: locationSettings,
       ).listen(
         (Position position) {
-          _updateFirestorePosition(pizzeriaId, name, status, position);
+          // Solo in memoria (gratis): la scrittura su Firestore la fa il timer.
+          _lastKnownPosition = position;
         },
         onError: (e) {
           LoggerService().log('Errore Stream GPS: $e');
         },
       );
       _positionStream = newStream;
+      _lastKnownPosition = initialPosition;
 
       setState(() => _currentStatus = status);
       await _persistStatus(status);
       _notifyOverlayStatus(status);
       await _updateFirestorePosition(pizzeriaId, name, status, initialPosition);
+      _lastWrittenPosition = initialPosition;
+
+      // Timer di aggiornamento: scrive la posizione ogni _updateInterval, ma
+      // SOLO se il rider si è spostato di almeno _minMovementMeters. Così la
+      // mappa del manager si muove in modo fluido mentre il rider va in giro,
+      // e da fermo non si sprecano scritture su Firebase.
+      _positionUpdateTimer?.cancel();
+      _positionUpdateTimer = Timer.periodic(_updateInterval, (_) {
+        if (_currentStatus == 'offline') return;
+        final pos = _lastKnownPosition;
+        if (pos == null) return;
+        final prev = _lastWrittenPosition;
+        if (prev != null) {
+          final moved = Geolocator.distanceBetween(
+            prev.latitude,
+            prev.longitude,
+            pos.latitude,
+            pos.longitude,
+          );
+          if (moved < _minMovementMeters) return; // fermo: niente scrittura
+        }
+        _lastWrittenPosition = pos;
+        _updateFirestorePosition(pizzeriaId, name, status, pos);
+      });
 
       LoggerService().log('Tracking attivato con successo: $status');
     } catch (e) {
@@ -565,6 +606,11 @@ class _RiderScreenState extends State<RiderScreen>
         _currentStatus = 'offline';
       }
       _notifyOverlayStatus('offline');
+
+      _positionUpdateTimer?.cancel();
+      _positionUpdateTimer = null;
+      _lastKnownPosition = null;
+      _lastWrittenPosition = null;
 
       try {
         await _positionStream?.cancel().timeout(const Duration(seconds: 2));
@@ -853,7 +899,7 @@ class _RiderScreenState extends State<RiderScreen>
           ),
           const SizedBox(height: 20),
           _buildStatusCard(
-            title: 'STO RIENTRANDRO',
+            title: 'STO RIENTRANDO',
             subtitle: 'Torna al ristorante per il prossimo ordine',
             icon: Icons.storefront,
             color: Colors.orange,
