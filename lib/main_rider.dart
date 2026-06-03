@@ -23,13 +23,27 @@ Future<void> main() async {
   runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
     await LoggerService().init();
-    
+
+    // Cattura gli errori del framework Flutter (es. errori di build/layout)
+    FlutterError.onError = (FlutterErrorDetails details) {
+      FlutterError.presentError(details);
+      LoggerService().log(
+        "FLUTTER ERROR: ${details.exceptionAsString()}\n${details.stack}",
+      );
+    };
+
+    // Cattura gli errori asincroni non gestiti a livello di piattaforma
+    WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
+      LoggerService().log("PLATFORM ERROR: $error\n$stack");
+      return true;
+    };
+
     try {
       await Firebase.initializeApp();
     } catch (e, stack) {
       await LoggerService().log("Errore inizializzazione Firebase: $e\n$stack");
     }
-    
+
     runApp(const RiderApp());
   }, (error, stack) {
      LoggerService().log("ERRORE GLOBALE RIDER: $error\n$stack");

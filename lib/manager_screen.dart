@@ -146,7 +146,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
   }
 
   Future<BitmapDescriptor> _createCustomMarker(String name, Color color) async {
-    final String cacheKey = '${name}_${color.value}';
+    final String cacheKey = '${name}_${color.toARGB32()}';
     if (_descriptorCache.containsKey(cacheKey)) {
       return _descriptorCache[cacheKey]!;
     }
@@ -204,7 +204,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
     );
     final Uint8List uint8List = byteData!.buffer.asUint8List();
 
-    final BitmapDescriptor descriptor = BitmapDescriptor.fromBytes(uint8List);
+    final BitmapDescriptor descriptor = BitmapDescriptor.bytes(uint8List);
     _descriptorCache[cacheKey] = descriptor;
     return descriptor;
   }
@@ -234,7 +234,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
           'Area Manager ($_pizzeriaId)',
           style: const TextStyle(fontWeight: FontWeight.bold),
         ),
-        backgroundColor: Colors.white.withOpacity(0.9),
+        backgroundColor: Colors.white.withValues(alpha: 0.9),
         elevation: 0,
         centerTitle: true,
         shape: const RoundedRectangleBorder(
@@ -306,7 +306,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
                             vertical: 8,
                           ),
                           decoration: BoxDecoration(
-                            color: Colors.black.withOpacity(0.6),
+                            color: Colors.black.withValues(alpha: 0.6),
                             borderRadius: BorderRadius.circular(20),
                           ),
                           child: const Text(
@@ -355,7 +355,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
                     borderRadius: BorderRadius.circular(20),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.black.withOpacity(0.1),
+                        color: Colors.black.withValues(alpha: 0.1),
                         blurRadius: 10,
                         offset: const Offset(0, 4),
                       ),
@@ -380,7 +380,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
                               vertical: 4,
                             ),
                             decoration: BoxDecoration(
-                              color: Colors.blue.withOpacity(0.1),
+                              color: Colors.blue.withValues(alpha: 0.1),
                               borderRadius: BorderRadius.circular(10),
                             ),
                             child: const Text(
@@ -441,7 +441,7 @@ class _ManagerScreenState extends State<ManagerScreen> {
                   borderRadius: BorderRadius.circular(16),
                   boxShadow: [
                     BoxShadow(
-                      color: Colors.black.withOpacity(0.05),
+                      color: Colors.black.withValues(alpha: 0.05),
                       blurRadius: 10,
                       offset: const Offset(0, 4),
                     ),

@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 class LoggerService {
@@ -20,13 +21,13 @@ class LoggerService {
   Future<void> log(String message) async {
     final timestamp = DateTime.now().toIso8601String();
     final logMessage = '[$timestamp] $message\n';
-    print(logMessage); // Stampa anche in console per debug immediato
+    debugPrint(logMessage); // Stampa anche in console per debug immediato
     
     if (_logFile != null) {
       try {
         await _logFile!.writeAsString(logMessage, mode: FileMode.append);
       } catch (e) {
-        print("Errore durante la scrittura del log: $e");
+        debugPrint("Errore durante la scrittura del log: $e");
       }
     }
   }

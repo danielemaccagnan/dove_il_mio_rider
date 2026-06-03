@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -13,7 +15,8 @@ class RiderScreen extends StatefulWidget {
   State<RiderScreen> createState() => _RiderScreenState();
 }
 
-class _RiderScreenState extends State<RiderScreen> {
+class _RiderScreenState extends State<RiderScreen>
+    with WidgetsBindingObserver {
   final TextEditingController _nameController = TextEditingController();
   final TextEditingController _pizzeriaController = TextEditingController();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -25,11 +28,27 @@ class _RiderScreenState extends State<RiderScreen> {
   StreamSubscription? _statusSubscription;
   bool _isInternalChange = false;
 
+  // Token di generazione: ogni operazione di avvio tracking ne prende uno.
+  // Se parte un'altra operazione (stop, reset, altro toggle) il token cambia
+  // e l'operazione "vecchia" si annulla invece di re-impostare lo stato.
+  // Risolve la race tra _toggleTracking (lungo) e stop/reset.
+  int _opGeneration = 0;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadConfiguration();
     _initOverlayListener();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Quando l'utente torna nell'app (es. dopo aver concesso il permesso
+    // overlay dalle impostazioni di sistema), riproviamo a mostrare la bolla.
+    if (state == AppLifecycleState.resumed && _isConfigured) {
+      _ensureOverlayIsShown();
+    }
   }
 
   void _initStatusListener(String pizzeriaId, String name) {
@@ -155,11 +174,32 @@ class _RiderScreenState extends State<RiderScreen> {
       return;
     }
 
+    // Permesso GPS richiesto SUBITO, in primo piano. Fondamentale: così quando
+    // poi avvii il tracking dalla bolla (con l'app in background) il permesso è
+    // già concesso e non serve mostrare alcun dialog — cosa che Android non
+    // permette di fare a un'app in background.
+    LocationPermission perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+    }
+    if ((perm == LocationPermission.denied ||
+            perm == LocationPermission.deniedForever) &&
+        mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Permesso posizione necessario: abilitalo per usare il tracking.',
+          ),
+          backgroundColor: Colors.orange,
+        ),
+      );
+    }
+
     // Check overlay permission
     final bool status = await FlutterOverlayWindow.isPermissionGranted();
     if (!status) {
       final bool? granted = await FlutterOverlayWindow.requestPermission();
-      if (granted != true) {
+      if (granted != true && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text(
@@ -182,20 +222,85 @@ class _RiderScreenState extends State<RiderScreen> {
   }
 
   Future<void> _resetConfiguration() async {
-    await _stopTracking();
-    await FlutterOverlayWindow.closeOverlay();
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('rider_name');
-    await prefs.remove('pizzeria_id');
-    setState(() {
-      _isConfigured = false;
-      _nameController.clear();
-      _pizzeriaController.clear();
-    });
+    LoggerService().log('Avvio reset configurazione...');
+    _opGeneration++; // annulla qualsiasi operazione di tracking in corso
+
+    // Catturiamo i dati PRIMA di pulire, servono per l'ultimo update Firestore.
+    final String name = _nameController.text.trim();
+    final String pizzeriaId = _pizzeriaController.text.trim();
+    final bool wasActive = _currentStatus != 'offline';
+
+    // 1) Cambiamo SUBITO schermata, prima di qualunque cleanup lento. Così la
+    //    UI torna SEMPRE alla configurazione, anche se la pulizia di
+    //    GPS/overlay/Firestore è lenta o si blocca (capita su MIUI).
+    if (mounted) {
+      setState(() {
+        _isConfigured = false;
+        _currentStatus = 'offline';
+        _isLoading = false;
+        _nameController.clear();
+        _pizzeriaController.clear();
+      });
+    }
+    LoggerService().log('Tornato alla schermata di configurazione.');
+
+    // 2) Cleanup "best effort": non deve mai bloccare il ritorno alla schermata.
+    try {
+      await _positionStream?.cancel().timeout(const Duration(seconds: 2));
+    } catch (e) {
+      LoggerService().log('Errore cancel GPS durante reset: $e');
+    }
+    _positionStream = null;
+
+    try {
+      await _statusSubscription?.cancel();
+    } catch (e) {
+      LoggerService().log('Errore cancel listener durante reset: $e');
+    }
+    _statusSubscription = null;
+
+    try {
+      await FlutterOverlayWindow.closeOverlay().timeout(
+        const Duration(seconds: 2),
+      );
+    } catch (e) {
+      LoggerService().log('Errore closeOverlay durante reset: $e');
+    }
+    _notifyOverlayStatus('offline');
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('rider_name');
+      await prefs.remove('pizzeria_id');
+      await prefs.setString('rider_status', 'offline');
+    } catch (e) {
+      LoggerService().log('Errore rimozione prefs durante reset: $e');
+    }
+
+    // Ultimo update a Firestore: il rider risulta offline sulla mappa.
+    if (name.isNotEmpty && pizzeriaId.isNotEmpty && wasActive) {
+      try {
+        await _firestore
+            .collection('pizzerie')
+            .doc(pizzeriaId)
+            .collection('riders')
+            .doc(name)
+            .set({
+              'status': 'offline',
+              'timestamp': FieldValue.serverTimestamp(),
+            }, SetOptions(merge: true))
+            .timeout(const Duration(seconds: 3));
+      } catch (e) {
+        LoggerService().log('Errore Firestore offline durante reset: $e');
+      }
+    }
+
+    LoggerService().log('Reset completato.');
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _positionStream?.cancel();
     _overlayListener?.cancel();
     _nameController.dispose();
@@ -205,24 +310,33 @@ class _RiderScreenState extends State<RiderScreen> {
     super.dispose();
   }
 
+  /// Stop richiesto dall'utente (pulsante TERMINA TURNO o tap sullo stato
+  /// attivo). Incrementa il token così un eventuale _toggleTracking in corso
+  /// viene annullato e non riattiva il tracking.
+  Future<void> _userStopTracking() async {
+    _opGeneration++;
+    await _stopTracking();
+  }
+
   Future<void> _toggleTracking(String status) async {
     if (!_isConfigured) return;
 
-    final String name = _nameController.text.trim();
-    final String pizzeriaId = _pizzeriaController.text.trim();
-
+    // Premere lo stato già attivo = ferma il turno.
     if (_currentStatus == status) {
-      await _stopTracking();
+      await _userStopTracking();
       return;
     }
 
-    _isInternalChange = true;
-    setState(() {
-      _isLoading = true;
-    });
+    final int myGen = ++_opGeneration;
+    final String name = _nameController.text.trim();
+    final String pizzeriaId = _pizzeriaController.text.trim();
 
+    _isInternalChange = true;
+    if (mounted) setState(() => _isLoading = true);
+
+    StreamSubscription<Position>? newStream;
     try {
-      LoggerService().log('Avvio tracking per: $status');
+      LoggerService().log('Avvio tracking per: $status (gen $myGen)');
       LocationPermission permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
         LoggerService().log('Richiedo permessi GPS...');
@@ -231,19 +345,27 @@ class _RiderScreenState extends State<RiderScreen> {
           throw Exception('Permessi GPS negati');
         }
       }
-
       if (permission == LocationPermission.deniedForever) {
         throw Exception(
           'Permessi GPS negati permanentemente. Abilitali dalle impostazioni.',
         );
       }
 
+      if (myGen != _opGeneration) {
+        LoggerService().log('Toggle $status annullato (operazione superata).');
+        return;
+      }
+
       LoggerService().log('Fermo tracking precedente...');
       await _stopTracking(keepOverlay: true);
 
-      late final LocationSettings locationSettings;
+      if (myGen != _opGeneration) {
+        LoggerService().log('Toggle $status annullato dopo stop precedente.');
+        return;
+      }
 
-      if (Theme.of(context).platform == TargetPlatform.android) {
+      final LocationSettings locationSettings;
+      if (defaultTargetPlatform == TargetPlatform.android) {
         locationSettings = AndroidSettings(
           accuracy: LocationAccuracy.high,
           distanceFilter: 30,
@@ -261,88 +383,40 @@ class _RiderScreenState extends State<RiderScreen> {
         );
       }
 
-      LoggerService().log('Avvio stream GPS...');
-      _positionStream =
-          Geolocator.getPositionStream(
-            locationSettings: locationSettings,
-          ).listen(
-            (Position position) {
-              _updateFirestorePosition(pizzeriaId, name, status, position);
-            },
-            onError: (e) {
-              LoggerService().log('Errore Stream GPS: $e');
-            },
-          );
-
       LoggerService().log('Ottengo posizione iniziale...');
-      Position initialPosition;
-      try {
-        initialPosition =
-            await Geolocator.getCurrentPosition(
-              locationSettings: const LocationSettings(
-                accuracy: LocationAccuracy.low,
-              ),
-            ).timeout(
-              const Duration(seconds: 5),
-              onTimeout: () {
-                LoggerService().log('TIMEOUT GPS! Uso ultima nota.');
-                return Geolocator.getLastKnownPosition().then(
-                  (val) =>
-                      val ??
-                      Position(
-                        latitude: 0,
-                        longitude: 0,
-                        timestamp: DateTime.now(),
-                        accuracy: 0,
-                        altitude: 0,
-                        heading: 0,
-                        speed: 0,
-                        speedAccuracy: 0,
-                        altitudeAccuracy: 0,
-                        headingAccuracy: 0,
-                      ),
-                );
-              },
-            );
-      } catch (e) {
-        LoggerService().log('Errore GPS iniziale: $e');
-        initialPosition =
-            await Geolocator.getLastKnownPosition() ??
-            Position(
-              latitude: 0,
-              longitude: 0,
-              timestamp: DateTime.now(),
-              accuracy: 0,
-              altitude: 0,
-              heading: 0,
-              speed: 0,
-              speedAccuracy: 0,
-              altitudeAccuracy: 0,
-              headingAccuracy: 0,
-            );
+      final Position initialPosition = await _getInitialPosition();
+
+      // Ultimo controllo prima di "committare": se nel frattempo l'utente ha
+      // fermato o resettato, non attiviamo nulla.
+      if (myGen != _opGeneration || !mounted) {
+        LoggerService().log('Toggle $status annullato prima dell\'attivazione.');
+        return;
       }
 
-      LoggerService().log('Aggiorno Firestore iniziale...');
-      if (mounted) {
-        setState(() {
-          _currentStatus = status;
-        });
-      }
+      LoggerService().log('Avvio stream GPS...');
+      newStream = Geolocator.getPositionStream(
+        locationSettings: locationSettings,
+      ).listen(
+        (Position position) {
+          _updateFirestorePosition(pizzeriaId, name, status, position);
+        },
+        onError: (e) {
+          LoggerService().log('Errore Stream GPS: $e');
+        },
+      );
+      _positionStream = newStream;
+
+      setState(() => _currentStatus = status);
+      await _persistStatus(status);
+      _notifyOverlayStatus(status);
       await _updateFirestorePosition(pizzeriaId, name, status, initialPosition);
 
-      LoggerService().log('Tracking attivato con successo');
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Tracking attivato: $status'),
-            backgroundColor: status == 'consegna' ? Colors.green : Colors.blue,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-      }
+      LoggerService().log('Tracking attivato con successo: $status');
     } catch (e) {
-      if (mounted) {
+      LoggerService().log('Errore _toggleTracking: $e');
+      await newStream?.cancel();
+      if (identical(newStream, _positionStream)) _positionStream = null;
+      if (mounted && myGen == _opGeneration) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Errore: $e'),
@@ -353,60 +427,132 @@ class _RiderScreenState extends State<RiderScreen> {
       }
     } finally {
       _isInternalChange = false;
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-        });
+      // Se l'operazione è stata superata da uno stop/reset, non lasciare uno
+      // stream "fantasma" attivo che continuerebbe a scrivere su Firestore.
+      if (myGen != _opGeneration && newStream != null) {
+        await newStream.cancel();
+        if (identical(newStream, _positionStream)) _positionStream = null;
+      }
+      if (mounted && myGen == _opGeneration) {
+        setState(() => _isLoading = false);
       }
     }
   }
 
+  /// Ottiene una posizione iniziale velocemente, con timeout e fallback
+  /// all'ultima posizione nota (o 0,0 se nulla è disponibile).
+  Future<Position> _getInitialPosition() async {
+    Position fallback() => Position(
+          latitude: 0,
+          longitude: 0,
+          timestamp: DateTime.now(),
+          accuracy: 0,
+          altitude: 0,
+          heading: 0,
+          speed: 0,
+          speedAccuracy: 0,
+          altitudeAccuracy: 0,
+          headingAccuracy: 0,
+        );
+    try {
+      return await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.low),
+      ).timeout(
+        const Duration(seconds: 5),
+        onTimeout: () async {
+          LoggerService().log('TIMEOUT GPS! Uso ultima nota.');
+          return await Geolocator.getLastKnownPosition() ?? fallback();
+        },
+      );
+    } catch (e) {
+      LoggerService().log('Errore GPS iniziale: $e');
+      return await Geolocator.getLastKnownPosition() ?? fallback();
+    }
+  }
+
+  /// Salva lo stato corrente nelle preferenze (usato anche dalla bolla per
+  /// conoscere il colore iniziale).
+  Future<void> _persistStatus(String status) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('rider_status', status);
+    } catch (e) {
+      LoggerService().log('Errore salvataggio stato: $e');
+    }
+  }
+
+  /// Notifica la bolla (engine separato) del nuovo stato, così ne aggiorna
+  /// il colore (verde = consegna, arancione = rientro).
+  void _notifyOverlayStatus(String status) {
+    FlutterOverlayWindow.shareData(status).catchError(
+      (e) => LoggerService().log('Errore invio stato a overlay: $e'),
+    );
+  }
+
   Future<void> _stopTracking({bool keepOverlay = false}) async {
+    final bool prevInternalChange = _isInternalChange;
     _isInternalChange = true;
     LoggerService().log('Eseguo _stopTracking (keepOverlay: $keepOverlay)...');
     try {
-      await _positionStream?.cancel();
+      final bool wasActive = _currentStatus != 'offline';
+
+      // PRIMA aggiorniamo lo stato locale (la UI esce subito dal tracking e
+      // l'icona di reset riappare), POI facciamo il cleanup lento che su alcuni
+      // device potrebbe bloccarsi.
+      if (mounted && _currentStatus != 'offline') {
+        setState(() => _currentStatus = 'offline');
+      } else {
+        _currentStatus = 'offline';
+      }
+      _notifyOverlayStatus('offline');
+
+      try {
+        await _positionStream?.cancel().timeout(const Duration(seconds: 2));
+      } catch (e) {
+        LoggerService().log('Errore cancel GPS: $e');
+      }
       _positionStream = null;
 
       if (!keepOverlay) {
         try {
-          await FlutterOverlayWindow.closeOverlay();
+          await FlutterOverlayWindow.closeOverlay().timeout(
+            const Duration(seconds: 2),
+          );
         } catch (e) {
           LoggerService().log('Errore chiusura overlay: $e');
         }
       }
 
+      await _persistStatus('offline');
+
       final String name = _nameController.text.trim();
       final String pizzeriaId = _pizzeriaController.text.trim();
 
-      if (name.isNotEmpty &&
-          pizzeriaId.isNotEmpty &&
-          _currentStatus != 'offline') {
+      if (name.isNotEmpty && pizzeriaId.isNotEmpty && wasActive) {
         LoggerService().log('Aggiorno Firestore a offline...');
-
-        // Aggiorniamo lo stato locale PRIMA della scrittura per evitare loop col listener
-        if (mounted) {
-          setState(() {
-            _currentStatus = 'offline';
-          });
-        }
-
         try {
           await _firestore
               .collection('pizzerie')
               .doc(pizzeriaId)
               .collection('riders')
               .doc(name)
-              .update({
+              .set({
                 'status': 'offline',
                 'timestamp': FieldValue.serverTimestamp(),
-              });
+              }, SetOptions(merge: true))
+              .timeout(const Duration(seconds: 3));
         } catch (e) {
           LoggerService().log('Errore aggiornamento Firestore offline: $e');
         }
       }
     } finally {
-      _isInternalChange = false;
+      // Ripristina il valore precedente invece di forzarlo a false: se questo
+      // _stopTracking è stato invocato DENTRO _toggleTracking, il guard deve
+      // restare attivo per tutta la durata del toggle. Altrimenti il listener
+      // Firestore vede lo stato scritto dalla bolla e re-innesca un toggle
+      // concorrente che annulla il primo (la bolla cambiava colore ma il
+      // tracking GPS non partiva mai).
+      _isInternalChange = prevInternalChange;
       LoggerService().log('_stopTracking completato.');
     }
   }
@@ -454,7 +600,22 @@ class _RiderScreenState extends State<RiderScreen> {
         foregroundColor: Colors.black,
         centerTitle: true,
         actions: [
-          if (_isConfigured && !isTracking)
+          IconButton(
+            icon: const Icon(Icons.bug_report_outlined),
+            tooltip: 'Log di debug',
+            onPressed: () async {
+              final logs = await LoggerService().getLogs();
+              if (context.mounted) {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => _RiderLogsScreen(logs: logs),
+                  ),
+                );
+              }
+            },
+          ),
+          if (_isConfigured)
             IconButton(
               icon: const Icon(Icons.logout_rounded),
               tooltip: 'Cambia Pizzeria/Nome',
@@ -575,7 +736,7 @@ class _RiderScreenState extends State<RiderScreen> {
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.05),
+            color: Colors.black.withValues(alpha: 0.05),
             blurRadius: 10,
             offset: const Offset(0, 4),
           ),
@@ -599,8 +760,9 @@ class _RiderScreenState extends State<RiderScreen> {
   }
 
   Widget _buildTrackingControls(bool isTracking) {
-    if (_isLoading)
+    if (_isLoading) {
       return const Expanded(child: Center(child: CircularProgressIndicator()));
+    }
 
     return Expanded(
       child: Column(
@@ -630,7 +792,7 @@ class _RiderScreenState extends State<RiderScreen> {
                 width: double.infinity,
                 height: 60,
                 child: TextButton.icon(
-                  onPressed: _stopTracking,
+                  onPressed: _resetConfiguration,
                   icon: const Icon(Icons.stop_circle, color: Colors.red),
                   label: const Text(
                     'TERMINA TURNO',
@@ -640,7 +802,7 @@ class _RiderScreenState extends State<RiderScreen> {
                     ),
                   ),
                   style: TextButton.styleFrom(
-                    backgroundColor: Colors.red.withOpacity(0.1),
+                    backgroundColor: Colors.red.withValues(alpha: 0.1),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(12),
                     ),
@@ -671,13 +833,13 @@ class _RiderScreenState extends State<RiderScreen> {
           color: active ? color : Colors.white,
           borderRadius: BorderRadius.circular(20),
           border: Border.all(
-            color: active ? color : Colors.grey.withOpacity(0.2),
+            color: active ? color : Colors.grey.withValues(alpha: 0.2),
             width: 2,
           ),
           boxShadow: active
               ? [
                   BoxShadow(
-                    color: color.withOpacity(0.3),
+                    color: color.withValues(alpha: 0.3),
                     blurRadius: 15,
                     offset: const Offset(0, 8),
                   ),
@@ -690,8 +852,8 @@ class _RiderScreenState extends State<RiderScreen> {
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: active
-                    ? Colors.white.withOpacity(0.2)
-                    : color.withOpacity(0.1),
+                    ? Colors.white.withValues(alpha: 0.2)
+                    : color.withValues(alpha: 0.1),
                 shape: BoxShape.circle,
               ),
               child: Icon(icon, color: active ? Colors.white : color, size: 32),
@@ -714,7 +876,7 @@ class _RiderScreenState extends State<RiderScreen> {
                     style: TextStyle(
                       fontSize: 13,
                       color: active
-                          ? Colors.white.withOpacity(0.8)
+                          ? Colors.white.withValues(alpha: 0.8)
                           : Colors.black54,
                     ),
                   ),
@@ -727,6 +889,50 @@ class _RiderScreenState extends State<RiderScreen> {
               Icon(Icons.arrow_forward_ios, size: 16, color: Colors.grey[400]),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// Schermata di debug per leggere/copiare/svuotare i log dell'app.
+class _RiderLogsScreen extends StatelessWidget {
+  final String logs;
+  const _RiderLogsScreen({required this.logs});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Log di Debug'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.copy),
+            tooltip: 'Copia tutti i log',
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: logs));
+              if (context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Log copiati negli appunti!')),
+                );
+              }
+            },
+          ),
+        ],
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: SelectableText(
+          logs.isEmpty ? 'Nessun log presente.' : logs,
+          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+        ),
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        icon: const Icon(Icons.delete),
+        label: const Text('Svuota'),
+        onPressed: () async {
+          await LoggerService().clearLogs();
+          if (context.mounted) Navigator.pop(context);
+        },
       ),
     );
   }
