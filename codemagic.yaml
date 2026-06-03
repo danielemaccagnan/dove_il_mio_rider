@@ -1,0 +1,36 @@
+# Codemagic — build iOS NON firmata, da installare sull'iPhone con Sideloadly
+# (firma con Apple ID gratuito su Windows). Compila l'app combinata (main.dart):
+# una sola app dove scegli "Rider" o "Manager" dalla schermata iniziale.
+#
+# Come usarlo:
+#  1. Vai su https://codemagic.io e accedi gratis con GitHub
+#  2. Aggiungi questo repo, scegli il workflow "ios-unsigned" e avvia il build
+#  3. Scarica l'artifact "app-unsigned.ipa"
+#  4. Su Windows usa Sideloadly per firmarla col tuo Apple ID e installarla
+workflows:
+  ios-unsigned:
+    name: iOS unsigned (per sideload con Sideloadly)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Flutter pub get
+        script: flutter pub get
+      - name: Pod install
+        script: |
+          cd ios
+          pod install
+      - name: Build iOS (senza firma)
+        script: |
+          flutter build ios --release --no-codesign
+      - name: Crea IPA non firmata
+        script: |
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -R Runner.app Payload/Runner.app
+          zip -r app-unsigned.ipa Payload
+    artifacts:
+      - build/ios/iphoneos/app-unsigned.ipa
