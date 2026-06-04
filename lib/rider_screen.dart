@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'logger_service.dart';
 import 'pizzeria_access.dart';
@@ -56,6 +57,33 @@ class _RiderScreenState extends State<RiderScreen>
   // in-app). Non viene mai forzata né blocca nulla.
   bool _bubbleEnabled = false;
 
+  // True (solo Android) se l'ottimizzazione batteria è ancora attiva: in quel
+  // caso il sistema può uccidere il tracking a schermo spento, quindi mostriamo
+  // un avviso con il pulsante per disattivarla.
+  bool _needsBatteryExemption = false;
+
+  /// Controlla se l'ottimizzazione batteria è ancora attiva (Android).
+  Future<void> _checkBatteryOptimization() async {
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    try {
+      final granted = await Permission.ignoreBatteryOptimizations.isGranted;
+      if (mounted) setState(() => _needsBatteryExemption = !granted);
+    } catch (e) {
+      LoggerService().log('Errore controllo batteria: $e');
+    }
+  }
+
+  /// Chiede al sistema di ignorare l'ottimizzazione batteria per l'app, così il
+  /// tracking continua anche a schermo spento.
+  Future<void> _requestBatteryExemption() async {
+    try {
+      await Permission.ignoreBatteryOptimizations.request();
+    } catch (e) {
+      LoggerService().log('Errore richiesta batteria: $e');
+    }
+    await _checkBatteryOptimization();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -66,10 +94,13 @@ class _RiderScreenState extends State<RiderScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Se il rider ha attivato la bolla, quando torna nell'app riproviamo a
-    // mostrarla (es. dopo aver concesso il permesso dalle impostazioni).
-    if (state == AppLifecycleState.resumed && _isConfigured && _bubbleEnabled) {
-      _ensureOverlayIsShown();
+    if (state == AppLifecycleState.resumed && _isConfigured) {
+      // Se il rider ha attivato la bolla, riproviamo a mostrarla (es. dopo aver
+      // concesso il permesso dalle impostazioni).
+      if (_bubbleEnabled) _ensureOverlayIsShown();
+      // Ricontrolla l'ottimizzazione batteria (l'utente potrebbe averla appena
+      // disattivata dalle impostazioni).
+      _checkBatteryOptimization();
     }
   }
 
@@ -159,6 +190,7 @@ class _RiderScreenState extends State<RiderScreen>
       });
       _initStatusListener(savedPizzeria, savedName);
       _startAuthListener(savedPizzeria);
+      _checkBatteryOptimization();
       // La bolla parte solo se il rider l'aveva attivata.
       if (_bubbleEnabled) _ensureOverlayIsShown();
     }
@@ -315,6 +347,7 @@ class _RiderScreenState extends State<RiderScreen>
     });
     _initStatusListener(pizzeriaId, name);
     _startAuthListener(pizzeriaId);
+    _checkBatteryOptimization();
   }
 
   /// Ascolta in tempo reale l'autorizzazione della pizzeria: se viene revocata
@@ -508,9 +541,14 @@ class _RiderScreenState extends State<RiderScreen>
           ),
         );
       } else {
-        locationSettings = const LocationSettings(
+        // iOS: abilita il tracking in background (anche a schermo spento).
+        // Mostra l'indicatore blu in alto e non mette in pausa il GPS.
+        locationSettings = AppleSettings(
           accuracy: LocationAccuracy.high,
           distanceFilter: 10,
+          allowBackgroundLocationUpdates: true,
+          showBackgroundLocationIndicator: true,
+          pauseLocationUpdatesAutomatically: false,
         );
       }
 
@@ -850,6 +888,11 @@ class _RiderScreenState extends State<RiderScreen>
               ),
               const SizedBox(height: 40),
 
+              if (_isConfigured && _needsBatteryExemption) ...[
+                _buildBatteryWarning(),
+                const SizedBox(height: 16),
+              ],
+
               if (!_isConfigured)
                 _buildConfigurationInput()
               else
@@ -857,6 +900,62 @@ class _RiderScreenState extends State<RiderScreen>
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// Avviso (Android) quando l'ottimizzazione batteria è attiva: spiega che il
+  /// tracking può fermarsi a schermo spento e offre il pulsante per disattivarla.
+  Widget _buildBatteryWarning() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.orange.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.orange.withValues(alpha: 0.4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.battery_alert, color: Colors.orange),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'Tracking a schermo spento',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 15,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'Per non perdere la posizione quando il telefono è in tasca o con lo '
+            'schermo spento, disattiva l\'ottimizzazione batteria per questa app.',
+            style: TextStyle(fontSize: 13, color: Colors.black87),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _requestBatteryExemption,
+              icon: const Icon(Icons.battery_saver, size: 18),
+              label: const Text('DISATTIVA OTTIMIZZAZIONE BATTERIA'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.orange,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
