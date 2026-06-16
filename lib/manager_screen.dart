@@ -9,6 +9,9 @@ import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'logger_service.dart';
 import 'pizzeria_access.dart';
+import 'pizzeria_zone.dart';
+import 'notification_service.dart';
+import 'stats_screen.dart';
 
 class ManagerScreen extends StatefulWidget {
   const ManagerScreen({super.key});
@@ -72,12 +75,38 @@ class _ManagerScreenState extends State<ManagerScreen>
   // Avvicinandosi compaiono i nomi.
   static const double _labelZoomThreshold = 14;
   bool _showLabels = false;
-  final Map<String, BitmapDescriptor> _dotIcons = {}; // colore -> pallino
+  final Map<String, BitmapDescriptor> _dotIcons = {}; // stato -> pallino
+
+  // --- Zona di consegna / posizione pizzeria ---
+  // Cerchio impostato dal manager: lo disegniamo sulla mappa e lo usiamo per
+  // capire quando un rider in rientro è arrivato (avviso di rientro).
+  DeliveryZone? _zone;
+  StreamSubscription? _zoneSubscription;
+  LatLng? _cameraTarget; // ultimo centro mappa, per impostare la zona
+
+  // Per la notifica "X è rientrato": ricordiamo chi era fuori dalla zona, così
+  // avvisiamo solo nel momento in cui entra.
+  final Set<String> _ridersInZone = {};
+
+  /// Colore associato a uno stato rider.
+  static Color _statusColor(String status) {
+    switch (status) {
+      case 'consegna':
+        return Colors.green;
+      case 'rientro':
+        return Colors.orange;
+      case 'pausa':
+        return Colors.blueGrey;
+      default:
+        return Colors.grey;
+    }
+  }
 
   @override
   void initState() {
     super.initState();
     _ticker = createTicker(_onTick);
+    NotificationService.instance.init();
     _loadConfiguration();
   }
 
@@ -102,6 +131,29 @@ class _ManagerScreenState extends State<ManagerScreen>
   bool _isStale(_RiderMarker r) =>
       DateTime.now().difference(r.lastUpdate) > _staleThreshold;
 
+  /// Notifica "X è rientrato" quando un rider in rientro entra nel cerchio della
+  /// pizzeria. Scatta una sola volta (al momento dell'ingresso nella zona).
+  void _checkArrival(String id, String name, String status, LatLng pos) {
+    final z = _zone;
+    if (z == null) return;
+    final bool inside = Geolocator.distanceBetween(
+          pos.latitude,
+          pos.longitude,
+          z.lat,
+          z.lng,
+        ) <=
+        z.radius;
+    final bool wasInside = _ridersInZone.contains(id);
+    if (status == 'rientro' && inside && !wasInside) {
+      NotificationService.instance.showRiderReturned(name);
+    }
+    if (inside) {
+      _ridersInZone.add(id);
+    } else {
+      _ridersInZone.remove(id);
+    }
+  }
+
   /// Costruisce il set di marker dalle posizioni interpolate correnti,
   /// nascondendo i rider fermi da troppo e scegliendo l'icona in base allo zoom.
   void _rebuildMarkers() {
@@ -109,7 +161,7 @@ class _ManagerScreenState extends State<ManagerScreen>
     final markers = <Marker>{};
     _riders.forEach((id, r) {
       if (_isStale(r)) return; // rider fermo/scollegato da troppo: nascosto
-      final dot = _dotIcons[r.status == 'consegna' ? 'consegna' : 'rientro'];
+      final dot = _dotIcons[r.status] ?? _dotIcons['rientro'];
       final BitmapDescriptor icon = _showLabels ? r.icon : (dot ?? r.icon);
       markers.add(
         Marker(
@@ -132,8 +184,9 @@ class _ManagerScreenState extends State<ManagerScreen>
   /// Genera (una volta) i pallini colorati usati da lontano.
   Future<void> _ensureDotIcons() async {
     if (_dotIcons.isNotEmpty) return;
-    _dotIcons['consegna'] = await _createDotMarker(Colors.green);
-    _dotIcons['rientro'] = await _createDotMarker(Colors.orange);
+    _dotIcons['consegna'] = await _createDotMarker(_statusColor('consegna'));
+    _dotIcons['rientro'] = await _createDotMarker(_statusColor('rientro'));
+    _dotIcons['pausa'] = await _createDotMarker(_statusColor('pausa'));
   }
 
   Future<BitmapDescriptor> _createDotMarker(Color color) async {
@@ -173,6 +226,7 @@ class _ManagerScreenState extends State<ManagerScreen>
     });
     if (_isConfigured && savedPizzeria != null) {
       _startAuthListener(savedPizzeria);
+      _startZoneListener(savedPizzeria);
       _loadManagerPosition();
     }
   }
@@ -256,7 +310,9 @@ class _ManagerScreenState extends State<ManagerScreen>
 
       seenIds.add(doc.id);
       final LatLng target = LatLng(lat, lng);
-      final Color color = status == 'consegna' ? Colors.green : Colors.orange;
+      final Color color = _statusColor(status);
+      // Avviso "X è rientrato" quando entra nella zona della pizzeria.
+      _checkArrival(doc.id, name, status, target);
       // Quando il rider ha aggiornato l'ultima volta (per il timeout fantasma).
       final ts = data['timestamp'];
       final DateTime lastUpdate = ts is Timestamp ? ts.toDate() : DateTime.now();
@@ -303,6 +359,9 @@ class _ManagerScreenState extends State<ManagerScreen>
 
     // Rimuovi i rider non più presenti (andati offline).
     _riders.removeWhere((id, _) => !seenIds.contains(id));
+    // Chi non è più online esce dalla zona: così al prossimo rientro l'avviso
+    // potrà scattare di nuovo.
+    _ridersInZone.removeWhere((id) => !seenIds.contains(id));
 
     _rebuildMarkers(); // riflette subito nuovi rider / rimozioni
     _ridersVersion.value++; // aggiorna la lista in basso
@@ -358,7 +417,95 @@ class _ManagerScreenState extends State<ManagerScreen>
     });
     _startRiderListener(pizzeriaId);
     _startAuthListener(pizzeriaId);
+    _startZoneListener(pizzeriaId);
     _loadManagerPosition();
+  }
+
+  /// Ascolta la zona di consegna salvata: la disegna sulla mappa e la usa per
+  /// gli avvisi di rientro.
+  void _startZoneListener(String pizzeriaId) {
+    _zoneSubscription?.cancel();
+    _zoneSubscription = deliveryZoneStream(pizzeriaId).listen((z) {
+      if (mounted) setState(() => _zone = z);
+    }, onError: (e) => LoggerService().log('Errore listener zona: $e'));
+  }
+
+  /// Salva la zona di consegna: centro = centro attuale della mappa, raggio
+  /// scelto dal manager con uno slider.
+  Future<void> _setupZoneDialog() async {
+    final code = _pizzeriaId;
+    if (code == null) return;
+    final LatLng center = _cameraTarget ?? _comoPosition.target;
+    double radius = _zone?.radius ?? 300;
+
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setLocal) {
+            return AlertDialog(
+              title: const Text('Zona di consegna'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Il centro è il punto al centro della mappa. Sposta la mappa '
+                    'sulla pizzeria prima di salvare. Scegli il raggio:',
+                    style: TextStyle(fontSize: 13),
+                  ),
+                  const SizedBox(height: 12),
+                  Text('Raggio: ${radius.round()} m',
+                      style: const TextStyle(fontWeight: FontWeight.bold)),
+                  Slider(
+                    value: radius,
+                    min: 100,
+                    max: 2000,
+                    divisions: 38,
+                    label: '${radius.round()} m',
+                    onChanged: (v) => setLocal(() => radius = v),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('ANNULLA'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('SALVA'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (confirmed == true) {
+      try {
+        await saveDeliveryZone(
+          code,
+          DeliveryZone(
+            lat: center.latitude,
+            lng: center.longitude,
+            radius: radius,
+          ),
+        );
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Zona di consegna salvata.')),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Errore salvataggio zona: $e')),
+          );
+        }
+      }
+    }
   }
 
   /// Logout automatico se l'autorizzazione della pizzeria viene revocata.
@@ -386,6 +533,8 @@ class _ManagerScreenState extends State<ManagerScreen>
   Future<void> _resetConfiguration() async {
     _riderSubscription?.cancel();
     _authSubscription?.cancel();
+    _zoneSubscription?.cancel();
+    _zoneSubscription = null;
     _freshnessTimer?.cancel();
     _freshnessTimer = null;
     if (_ticker.isActive) _ticker.stop();
@@ -398,6 +547,8 @@ class _ManagerScreenState extends State<ManagerScreen>
       _descriptorCache.clear();
       _riderStatusCache.clear();
       _riders.clear();
+      _zone = null;
+      _ridersInZone.clear();
       _markersNotifier.value = {};
     });
   }
@@ -495,6 +646,10 @@ class _ManagerScreenState extends State<ManagerScreen>
               final eb = _etaMinutes(b.targetPos) ?? 9999;
               return ea.compareTo(eb);
             });
+            final pausa = _riders.values
+                .where((r) => r.status == 'pausa' && !_isStale(r))
+                .toList()
+              ..sort((a, b) => a.name.compareTo(b.name));
 
             return SafeArea(
               child: Padding(
@@ -551,6 +706,14 @@ class _ManagerScreenState extends State<ManagerScreen>
                               Icons.keyboard_return,
                               rientro,
                               showEta: true,
+                            ),
+                            const SizedBox(height: 20),
+                            _buildRiderSection(
+                              'In pausa',
+                              Colors.blueGrey,
+                              Icons.pause_circle_filled,
+                              pausa,
+                              showEta: false,
                             ),
                           ],
                         ),
@@ -656,6 +819,7 @@ class _ManagerScreenState extends State<ManagerScreen>
     _ticker.dispose();
     _riderSubscription?.cancel();
     _authSubscription?.cancel();
+    _zoneSubscription?.cancel();
     _freshnessTimer?.cancel();
     _pizzeriaController.dispose();
     _markersNotifier.dispose();
@@ -691,6 +855,29 @@ class _ManagerScreenState extends State<ManagerScreen>
             icon: const Icon(Icons.format_list_bulleted_rounded),
             tooltip: 'Lista rider',
             onPressed: _showRidersList,
+          ),
+          IconButton(
+            icon: const Icon(Icons.bar_chart_rounded),
+            tooltip: 'Statistiche consegne',
+            onPressed: () {
+              final code = _pizzeriaId;
+              if (code == null) return;
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => StatsScreen(pizzeriaId: code),
+                ),
+              );
+            },
+          ),
+          IconButton(
+            icon: Icon(
+              _zone == null
+                  ? Icons.add_location_alt_outlined
+                  : Icons.edit_location_alt,
+            ),
+            tooltip: 'Imposta zona di consegna',
+            onPressed: _setupZoneDialog,
           ),
           IconButton(
             icon: const Icon(Icons.logout_rounded),
@@ -733,6 +920,7 @@ class _ManagerScreenState extends State<ManagerScreen>
                     key: const ValueKey('manager_google_map'),
                     initialCameraPosition: _comoPosition,
                     markers: markers,
+                    circles: _buildCircles(),
                     myLocationEnabled: true,
                     myLocationButtonEnabled: false,
                     zoomControlsEnabled: false,
@@ -743,6 +931,7 @@ class _ManagerScreenState extends State<ManagerScreen>
                       );
                     },
                     onCameraMove: (pos) {
+                      _cameraTarget = pos.target; // per impostare la zona
                       // Da vicino mostra i nomi, da lontano i pallini. Ridisegna
                       // i marker solo quando si supera la soglia (non ad ogni
                       // micro-movimento della camera).
@@ -858,9 +1047,11 @@ class _ManagerScreenState extends State<ManagerScreen>
                       const SizedBox(height: 12),
                       Row(
                         children: [
-                          _buildLegendItem(Colors.green, 'In Consegna'),
-                          const SizedBox(width: 16),
-                          _buildLegendItem(Colors.orange, 'In Rientro'),
+                          _buildLegendItem(Colors.green, 'Consegna'),
+                          const SizedBox(width: 12),
+                          _buildLegendItem(Colors.orange, 'Rientro'),
+                          const SizedBox(width: 12),
+                          _buildLegendItem(Colors.blueGrey, 'Pausa'),
                         ],
                       ),
                     ],
@@ -947,6 +1138,22 @@ class _ManagerScreenState extends State<ManagerScreen>
         ),
       ),
     );
+  }
+
+  /// Cerchio della zona di consegna (vuoto se non impostata).
+  Set<Circle> _buildCircles() {
+    final z = _zone;
+    if (z == null) return {};
+    return {
+      Circle(
+        circleId: const CircleId('zona_consegna'),
+        center: LatLng(z.lat, z.lng),
+        radius: z.radius,
+        fillColor: Colors.blue.withValues(alpha: 0.10),
+        strokeColor: Colors.blue.withValues(alpha: 0.6),
+        strokeWidth: 2,
+      ),
+    };
   }
 
   Widget _buildLegendItem(Color color, String label) {

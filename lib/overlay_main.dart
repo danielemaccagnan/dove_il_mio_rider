@@ -93,6 +93,8 @@ class _FloatingBubbleOverlayState extends State<FloatingBubbleOverlay> {
         return Colors.green;
       case 'rientro':
         return Colors.orange;
+      case 'pausa':
+        return Colors.blueGrey;
       default:
         return Colors.white;
     }

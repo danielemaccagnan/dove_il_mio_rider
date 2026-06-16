@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 /// Configurazione Firebase per iOS, identica ai valori di GoogleService-Info.plist
 /// (progetto trova-il-mio-rider, lo stesso di Android -> dati condivisi).
@@ -26,5 +27,17 @@ Future<void> initFirebaseCrossPlatform() async {
     await Firebase.initializeApp(options: iosFirebaseOptions);
   } else {
     await Firebase.initializeApp();
+  }
+
+  // Modalità offline: abilita la cache locale di Firestore senza limiti, così
+  // l'app continua a funzionare senza rete e le scritture (posizione, consegne)
+  // vengono messe in coda e sincronizzate appena la connessione torna.
+  try {
+    FirebaseFirestore.instance.settings = const Settings(
+      persistenceEnabled: true,
+      cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
+    );
+  } catch (_) {
+    // Già configurato (es. secondo motore Flutter della bolla): ignora.
   }
 }

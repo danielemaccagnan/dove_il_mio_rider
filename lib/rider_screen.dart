@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -9,6 +9,9 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'logger_service.dart';
 import 'pizzeria_access.dart';
+import 'pizzeria_zone.dart';
+import 'delivery_log.dart';
+import 'battery_guide_screen.dart';
 
 class RiderScreen extends StatefulWidget {
   const RiderScreen({super.key});
@@ -17,8 +20,7 @@ class RiderScreen extends StatefulWidget {
   State<RiderScreen> createState() => _RiderScreenState();
 }
 
-class _RiderScreenState extends State<RiderScreen>
-    with WidgetsBindingObserver {
+class _RiderScreenState extends State<RiderScreen> with WidgetsBindingObserver {
   final TextEditingController _nameController = TextEditingController();
   final TextEditingController _pizzeriaController = TextEditingController();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -40,6 +42,32 @@ class _RiderScreenState extends State<RiderScreen>
   Timer? _positionUpdateTimer;
   static const Duration _updateInterval = Duration(seconds: 5);
   static const double _minMovementMeters = 3;
+
+  // --- Registro consegne (per statistiche/storico del manager) ---
+  // Una "consegna" = una sessione in stato 'consegna'. Quando inizia salviamo
+  // l'ora e azzeriamo i km; quando finisce (rientro/pausa/fine turno) scriviamo
+  // un record con durata e distanza percorsa.
+  DateTime? _consegnaStart;
+  double _consegnaDistanceMeters = 0;
+  Position? _lastDistanceSample;
+
+  // --- Rientro automatico (geofence) ---
+  // Quando il rider in 'rientro' entra nel cerchio della pizzeria impostato dal
+  // manager, il turno si chiude da solo (conferma rientro). _returnTriggered
+  // evita che scatti più volte; si riarma a ogni nuovo 'rientro'.
+  DeliveryZone? _zone;
+  StreamSubscription? _zoneSubscription;
+  bool _returnTriggered = false;
+
+  // Indicatore "modalità offline": true quando i dati arrivano dalla cache
+  // (rete assente). Le scritture vengono comunque messe in coda e sincronizzate
+  // da Firestore appena torna la connessione.
+  bool _offline = false;
+  bool _hasServerData = false;
+
+  /// Codice pizzeria usato per scrivere/leggere su Firestore (coerente con
+  /// dove viene scritto il documento del rider).
+  String get _pizzeriaCode => _pizzeriaController.text.trim();
 
   // Token di generazione: ogni operazione di avvio tracking ne prende uno.
   // Se parte un'altra operazione (stop, reset, altro toggle) il token cambia
@@ -113,6 +141,13 @@ class _RiderScreenState extends State<RiderScreen>
         .doc(name)
         .snapshots()
         .listen((snapshot) {
+          // Indicatore offline: dopo aver visto almeno un dato dal server, se
+          // arrivano solo dati dalla cache significa che la rete è assente.
+          final bool fromCache = snapshot.metadata.isFromCache;
+          if (!fromCache) _hasServerData = true;
+          final bool off = _hasServerData && fromCache;
+          if (off != _offline && mounted) setState(() => _offline = off);
+
           if (_isInternalChange) {
             LoggerService().log('Ignoro update Firestore (cambio interno)');
             return;
@@ -190,6 +225,7 @@ class _RiderScreenState extends State<RiderScreen>
       });
       _initStatusListener(savedPizzeria, savedName);
       _startAuthListener(savedPizzeria);
+      _startZoneListener(savedPizzeria);
       _checkBatteryOptimization();
       // La bolla parte solo se il rider l'aveva attivata.
       if (_bubbleEnabled) _ensureOverlayIsShown();
@@ -238,9 +274,9 @@ class _RiderScreenState extends State<RiderScreen>
       } catch (_) {}
       if (mounted) {
         setState(() => _bubbleEnabled = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Bolla disattivata.')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Bolla disattivata.')));
       }
       return;
     }
@@ -254,9 +290,9 @@ class _RiderScreenState extends State<RiderScreen>
     if (granted) {
       await _ensureOverlayIsShown();
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Bolla attivata.')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Bolla attivata.')));
       }
     } else {
       if (mounted) {
@@ -347,7 +383,18 @@ class _RiderScreenState extends State<RiderScreen>
     });
     _initStatusListener(pizzeriaId, name);
     _startAuthListener(pizzeriaId);
+    _startZoneListener(pizzeriaId);
     _checkBatteryOptimization();
+  }
+
+  /// Ascolta la zona di consegna impostata dal manager: serve al rientro
+  /// automatico (geofence) quando il rider si avvicina alla pizzeria.
+  void _startZoneListener(String pizzeriaId) {
+    _zoneSubscription?.cancel();
+    _zoneSubscription = deliveryZoneStream(pizzeriaId).listen(
+      (z) => _zone = z,
+      onError: (e) => LoggerService().log('Errore listener zona: $e'),
+    );
   }
 
   /// Ascolta in tempo reale l'autorizzazione della pizzeria: se viene revocata
@@ -382,6 +429,12 @@ class _RiderScreenState extends State<RiderScreen>
     final String pizzeriaId = _pizzeriaController.text.trim();
     final bool wasActive = _currentStatus != 'offline';
 
+    // Registra l'eventuale consegna in corso prima di azzerare nome/pizzeria.
+    _finalizeConsegnaIfAny();
+    _returnTriggered = false;
+    _offline = false;
+    _hasServerData = false;
+
     // 1) Cambiamo SUBITO schermata, prima di qualunque cleanup lento. Così la
     //    UI torna SEMPRE alla configurazione, anche se la pulizia di
     //    GPS/overlay/Firestore è lenta o si blocca (capita su MIUI).
@@ -412,11 +465,14 @@ class _RiderScreenState extends State<RiderScreen>
     try {
       await _statusSubscription?.cancel();
       await _authSubscription?.cancel();
+      await _zoneSubscription?.cancel();
     } catch (e) {
       LoggerService().log('Errore cancel listener durante reset: $e');
     }
     _statusSubscription = null;
     _authSubscription = null;
+    _zoneSubscription = null;
+    _zone = null;
 
     if (_overlaySupported) {
       try {
@@ -471,6 +527,7 @@ class _RiderScreenState extends State<RiderScreen>
     if (_overlaySupported) FlutterOverlayWindow.closeOverlay();
     _statusSubscription?.cancel();
     _authSubscription?.cancel();
+    _zoneSubscription?.cancel();
     super.dispose();
   }
 
@@ -491,6 +548,7 @@ class _RiderScreenState extends State<RiderScreen>
       return;
     }
 
+    final String prevStatus = _currentStatus;
     final int myGen = ++_opGeneration;
     final String name = _nameController.text.trim();
     final String pizzeriaId = _pizzeriaController.text.trim();
@@ -518,6 +576,30 @@ class _RiderScreenState extends State<RiderScreen>
       if (myGen != _opGeneration) {
         LoggerService().log('Toggle $status annullato (operazione superata).');
         return;
+      }
+
+      // Modello abbonamento: rispetta il numero massimo di rider online del
+      // piano. Controllato solo quando si parte da fermo (offline -> attivo);
+      // un cambio tra stati attivi (es. consegna -> rientro) è sempre permesso.
+      if (prevStatus == 'offline') {
+        final slot = await checkRiderSlot(pizzeriaId, name);
+        if (myGen != _opGeneration) return;
+        if (slot == RiderSlotResult.full) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'Limite rider del piano raggiunto: un altro rider deve '
+                  'terminare il turno per liberare un posto.',
+                ),
+                backgroundColor: Colors.orange,
+                duration: Duration(seconds: 4),
+              ),
+            );
+          }
+          return; // il blocco finally ripristina i flag
+        }
+        // RiderSlotResult.error -> consentiamo (non blocchiamo per un calo rete).
       }
 
       LoggerService().log('Fermo tracking precedente...');
@@ -558,26 +640,40 @@ class _RiderScreenState extends State<RiderScreen>
       // Ultimo controllo prima di "committare": se nel frattempo l'utente ha
       // fermato o resettato, non attiviamo nulla.
       if (myGen != _opGeneration || !mounted) {
-        LoggerService().log('Toggle $status annullato prima dell\'attivazione.');
+        LoggerService().log(
+          'Toggle $status annullato prima dell\'attivazione.',
+        );
         return;
       }
 
       LoggerService().log('Avvio stream GPS...');
-      newStream = Geolocator.getPositionStream(
-        locationSettings: locationSettings,
-      ).listen(
-        (Position position) {
-          // Solo in memoria (gratis): la scrittura su Firestore la fa il timer.
-          _lastKnownPosition = position;
-        },
-        onError: (e) {
-          LoggerService().log('Errore Stream GPS: $e');
-        },
-      );
+      newStream =
+          Geolocator.getPositionStream(
+            locationSettings: locationSettings,
+          ).listen(
+            (Position position) {
+              // Solo in memoria (gratis): la scrittura su Firestore la fa il timer.
+              _lastKnownPosition = position;
+              // Accumula i km della consegna e gestisce il rientro automatico.
+              _onPositionUpdate(position);
+            },
+            onError: (e) {
+              LoggerService().log('Errore Stream GPS: $e');
+            },
+          );
       _positionStream = newStream;
       _lastKnownPosition = initialPosition;
 
       setState(() => _currentStatus = status);
+      // Avvia la sessione consegna (per durata/km) o riarma il rientro
+      // automatico a seconda del nuovo stato.
+      if (status == 'consegna') {
+        _consegnaStart = DateTime.now();
+        _consegnaDistanceMeters = 0;
+        _lastDistanceSample = initialPosition;
+      } else if (status == 'rientro') {
+        _returnTriggered = false;
+      }
       await _persistStatus(status);
       _notifyOverlayStatus(status);
       await _updateFirestorePosition(pizzeriaId, name, status, initialPosition);
@@ -638,20 +734,22 @@ class _RiderScreenState extends State<RiderScreen>
   /// all'ultima posizione nota (o 0,0 se nulla è disponibile).
   Future<Position> _getInitialPosition() async {
     Position fallback() => Position(
-          latitude: 0,
-          longitude: 0,
-          timestamp: DateTime.now(),
-          accuracy: 0,
-          altitude: 0,
-          heading: 0,
-          speed: 0,
-          speedAccuracy: 0,
-          altitudeAccuracy: 0,
-          headingAccuracy: 0,
-        );
+      latitude: 0,
+      longitude: 0,
+      timestamp: DateTime.now(),
+      accuracy: 0,
+      altitude: 0,
+      heading: 0,
+      speed: 0,
+      speedAccuracy: 0,
+      altitudeAccuracy: 0,
+      headingAccuracy: 0,
+    );
     try {
       return await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(accuracy: LocationAccuracy.low),
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.low,
+        ),
       ).timeout(
         const Duration(seconds: 5),
         onTimeout: () async {
@@ -691,6 +789,9 @@ class _RiderScreenState extends State<RiderScreen>
     LoggerService().log('Eseguo _stopTracking (keepOverlay: $keepOverlay)...');
     try {
       final bool wasActive = _currentStatus != 'offline';
+
+      // Se stavamo facendo una consegna, registrala prima di azzerare lo stato.
+      _finalizeConsegnaIfAny();
 
       // PRIMA aggiorniamo lo stato locale (la UI esce subito dal tracking e
       // l'icona di reset riappare), POI facciamo il cleanup lento che su alcuni
@@ -758,6 +859,88 @@ class _RiderScreenState extends State<RiderScreen>
     }
   }
 
+  /// Se è in corso una consegna, la chiude e la registra (durata + km) per le
+  /// statistiche del manager. Consegne troppo brevi (tap per errore) vengono
+  /// ignorate.
+  void _finalizeConsegnaIfAny() {
+    final start = _consegnaStart;
+    _consegnaStart = null;
+    final double meters = _consegnaDistanceMeters;
+    _consegnaDistanceMeters = 0;
+    _lastDistanceSample = null;
+    if (start == null) return;
+
+    final end = DateTime.now();
+    final int dur = end.difference(start).inSeconds;
+    if (dur < 20) return; // troppo breve: non è una consegna reale
+
+    final pizzeriaId = _pizzeriaCode;
+    final name = _nameController.text.trim();
+    if (pizzeriaId.isEmpty || name.isEmpty) return;
+
+    logDelivery(
+      pizzeriaId,
+      DeliveryRecord(
+        riderName: name,
+        startedAt: start,
+        endedAt: end,
+        durationSec: dur,
+        distanceMeters: meters,
+      ),
+    );
+    LoggerService().log('Consegna registrata: ${dur}s, ${meters.toStringAsFixed(0)}m');
+  }
+
+  /// Accumula la distanza percorsa durante la consegna e fa scattare il rientro
+  /// automatico quando il rider rientrante entra nella zona della pizzeria.
+  void _onPositionUpdate(Position position) {
+    // Distanza percorsa (solo in consegna), con filtro anti-rumore GPS.
+    if (_currentStatus == 'consegna') {
+      final prev = _lastDistanceSample;
+      if (prev != null) {
+        final d = Geolocator.distanceBetween(
+          prev.latitude,
+          prev.longitude,
+          position.latitude,
+          position.longitude,
+        );
+        if (d >= 2 && d < 200) _consegnaDistanceMeters += d;
+      }
+      _lastDistanceSample = position;
+    }
+
+    // Rientro automatico (geofence).
+    if (_currentStatus == 'rientro' && !_returnTriggered) {
+      final z = _zone;
+      if (z != null) {
+        final dist = Geolocator.distanceBetween(
+          position.latitude,
+          position.longitude,
+          z.lat,
+          z.lng,
+        );
+        if (dist <= z.radius) {
+          _returnTriggered = true;
+          LoggerService().log('Rientro automatico: dentro la zona ($dist m).');
+          _autoConfirmReturn();
+        }
+      }
+    }
+  }
+
+  /// Chiude il turno automaticamente quando il rider è rientrato in zona.
+  Future<void> _autoConfirmReturn() async {
+    await _userStopTracking();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Rientro confermato automaticamente. Turno in pausa.'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    }
+  }
+
   Future<void> _updateFirestorePosition(
     String pizzeriaId,
     String name,
@@ -817,6 +1000,16 @@ class _RiderScreenState extends State<RiderScreen>
                   : 'Attiva bolla (opzionale)',
               onPressed: _toggleBubble,
             ),
+          IconButton(
+            icon: const Icon(Icons.help_outline),
+            tooltip: 'Guida: tracking sempre attivo',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => const BatteryGuideScreen(),
+              ),
+            ),
+          ),
           IconButton(
             icon: const Icon(Icons.bug_report_outlined),
             tooltip: 'Log di debug',
@@ -888,6 +1081,11 @@ class _RiderScreenState extends State<RiderScreen>
               ),
               const SizedBox(height: 40),
 
+              if (_isConfigured && _offline) ...[
+                _buildOfflineBanner(),
+                const SizedBox(height: 16),
+              ],
+
               if (_isConfigured && _needsBatteryExemption) ...[
                 _buildBatteryWarning(),
                 const SizedBox(height: 16),
@@ -900,6 +1098,32 @@ class _RiderScreenState extends State<RiderScreen>
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// Banner "modalità offline": rete assente. I dati continuano a essere
+  /// salvati localmente e si sincronizzano da soli al ritorno della connessione.
+  Widget _buildOfflineBanner() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.blueGrey.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: const [
+          Icon(Icons.cloud_off, color: Colors.blueGrey, size: 20),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Modalità offline: la posizione viene salvata e inviata appena '
+              'torna la connessione.',
+              style: TextStyle(fontSize: 13, color: Colors.black87),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -925,10 +1149,7 @@ class _RiderScreenState extends State<RiderScreen>
               const Expanded(
                 child: Text(
                   'Tracking a schermo spento',
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 15,
-                  ),
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
                 ),
               ),
             ],
@@ -954,6 +1175,16 @@ class _RiderScreenState extends State<RiderScreen>
                 ),
               ),
             ),
+          ),
+          TextButton.icon(
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => const BatteryGuideScreen(),
+              ),
+            ),
+            icon: const Icon(Icons.menu_book, size: 18),
+            label: const Text('Guida completa per la tua marca'),
           ),
         ],
       ),
@@ -1061,6 +1292,15 @@ class _RiderScreenState extends State<RiderScreen>
             color: Colors.orange,
             active: _currentStatus == 'rientro',
             onTap: () => _toggleTracking('rientro'),
+          ),
+          const SizedBox(height: 20),
+          _buildStatusCard(
+            title: 'IN PAUSA',
+            subtitle: 'Pausa caffè o sosta: resti visibile ma non in consegna',
+            icon: Icons.pause_circle_filled,
+            color: Colors.blueGrey,
+            active: _currentStatus == 'pausa',
+            onTap: () => _toggleTracking('pausa'),
           ),
           const Spacer(),
           if (isTracking)

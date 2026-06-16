@@ -43,6 +43,8 @@ dependencies:
   shared_preferences: ^2.3.5
   flutter_overlay_window: ^0.4.5
   firebase_crashlytics: ^5.2.3
+  flutter_local_notifications: ^22.0.1
+  share_plus: ^13.1.0
 
 dev_dependencies:
   flutter_test:
